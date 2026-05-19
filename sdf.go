@@ -81,7 +81,9 @@ type Field struct {
 	bvh   *bvhNode // built lazily on first eval
 }
 
-func (f *Field) ensureBVH() {
+// Build eagerly constructs the BVH so concurrent Eval callers don't race.
+// Idempotent.
+func (f *Field) Build() {
 	if f.bvh != nil {
 		return
 	}
@@ -89,7 +91,6 @@ func (f *Field) ensureBVH() {
 }
 
 func (f *Field) Eval(p Vec3) float64 {
-	f.ensureBVH()
 	const initial = 1e9
 	v := initial
 	// We seed with a hard min from the BVH to cull primitives whose bounding
@@ -97,6 +98,12 @@ func (f *Field) Eval(p Vec3) float64 {
 	// the kernel's effective range (~3/K). Once we have a tight hard min,
 	// only nearby primitives meaningfully contribute.
 	hardMin := bvhHardMin(f.bvh, p, initial)
+	// Far-from-anything fast path: if we're well outside every primitive's
+	// kernel reach, smooth-min is numerically equal to hard-min. Skips the
+	// second BVH descent entirely (a big chunk of mostly-empty voxels).
+	if hardMin > 5.0/f.K {
+		return hardMin
+	}
 	cutoff := hardMin + 3.0/f.K // beyond this, e^{-k·(d-hardMin)} < e^-3 ≈ 0.05
 	v = bvhSmoothMin(f.bvh, p, v, cutoff, f.K)
 	if v >= initial-1 {
