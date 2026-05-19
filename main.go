@@ -25,6 +25,9 @@ func main() {
 	seedFlag := flag.String("seed", "", "hex seed (e.g. 1a2b3c). Empty = random.")
 	autoSpin := flag.Bool("spin", true, "auto-rotate while idle")
 	stlOnly := flag.String("stl", "", "if set, write STL to this path and exit (no window)")
+	mode := flag.String("mode", "skin", "render mode: 'debug' (per-feature mesh, colored) or 'skin' (implicit SDF + marching cubes, single skin)")
+	mcRes := flag.Int("res", 160, "skin mode: marching-cubes grid resolution per axis")
+	blendK := flag.Float64("k", 35.0, "skin mode: smooth-min sharpness (larger = sharper joints)")
 	flag.Parse()
 
 	settings := DefaultSettings()
@@ -39,7 +42,19 @@ func main() {
 		currentSeed = uint32(rand.Uint32() & 0xffffff)
 	}
 
-	root := BuildScene(settings, currentSeed)
+	skinParams := DefaultSkinParams()
+	skinParams.Resolution = *mcRes
+	skinParams.BlendK = *blendK
+
+	build := func(seed uint32) *Group {
+		switch *mode {
+		case "skin":
+			return BuildSkin(settings, seed, skinParams)
+		default:
+			return BuildScene(settings, seed)
+		}
+	}
+	root := build(currentSeed)
 
 	// Headless mode: write the STL and exit.
 	if *stlOnly != "" {
@@ -88,7 +103,7 @@ func main() {
 
 	regen := func() {
 		currentSeed = uint32(rand.Uint32() & 0xffffff)
-		root = BuildScene(settings, currentSeed)
+		root = build(currentSeed)
 		r.Upload(root)
 		fmt.Printf("regenerated, seed=%06x\n", currentSeed)
 	}
