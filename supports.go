@@ -410,21 +410,5 @@ func renderSupport(s Settings, ss Support) *Group {
 	mid := ss.P1.Add(ss.P2).Mul(0.5)
 	dirN := ss.P2.Sub(ss.P1).Normalize()
 	addCylinder(g, mid, dirN, l, s.ButtressR*0.85, s.ButtressR*1.05, 16, baseMat)
-	var beadColor int
-	switch ss.BeadKind {
-	case "inner":
-		beadColor = Colors.SnapToInner
-	case "support":
-		beadColor = Colors.CollisionSnap
-	case "wire":
-		beadColor = Colors.SnappedToWire
-	default:
-		beadColor = Colors.LandingBead
-	}
-	beadR := s.ButtressR * 1.3
-	if ss.Kind == "pyramid" {
-		beadR = s.ButtressR * 1.4
-	}
-	addSphere(g, ss.P2, beadR, 14, 10, newMat(beadColor, true))
 	return g
 }

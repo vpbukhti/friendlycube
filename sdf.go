@@ -37,6 +37,33 @@ type Sphere struct {
 func (s Sphere) Dist(p Vec3) float64 { return p.Sub(s.Center).Len() - s.Radius }
 func (s Sphere) Bounds() AABB        { return aabbFromPoint(s.Center, s.Radius) }
 
+// RoundedBox: Minkowski-rounded cube — an inner box of half-extents
+// HalfSize, expanded by R. Total outer half-extent on each axis is
+// HalfSize + R. Used as a clip primitive (smooth-max'd into the field) so
+// the outer cube reads as a slightly-rounded d6: flat faces, quarter-
+// cylinder edges of radius R, 1/8-sphere corners of radius R.
+type RoundedBox struct {
+	HalfSize Vec3
+	R        float64
+}
+
+func (b RoundedBox) Dist(p Vec3) float64 {
+	qx := math.Abs(p[0]) - b.HalfSize[0]
+	qy := math.Abs(p[1]) - b.HalfSize[1]
+	qz := math.Abs(p[2]) - b.HalfSize[2]
+	mx := math.Max(qx, 0)
+	my := math.Max(qy, 0)
+	mz := math.Max(qz, 0)
+	outer := math.Sqrt(mx*mx + my*my + mz*mz)
+	inner := math.Min(math.Max(math.Max(qx, qy), qz), 0)
+	return outer + inner - b.R
+}
+
+func (b RoundedBox) Bounds() AABB {
+	hx, hy, hz := b.HalfSize[0]+b.R, b.HalfSize[1]+b.R, b.HalfSize[2]+b.R
+	return AABB{Min: V(-hx, -hy, -hz), Max: V(hx, hy, hz)}
+}
+
 // Capsule: distance to segment A→B, minus radius.
 type Capsule struct {
 	A, B   Vec3
@@ -72,11 +99,23 @@ func smin(a, b, k float64) float64 {
 	return m - math.Log(ea+eb)/k
 }
 
+// smax: smooth-maximum via the standard identity. Used to intersect the
+// smin'd field with a clip primitive (negative inside the clip shape).
+func smax(a, b, k float64) float64 {
+	return -smin(-a, -b, k)
+}
+
 // Field is the signed-distance function that smooth-mins every primitive in
-// `prims`. The k parameter controls joint sharpness: large k → sharp/boolean
-// look; small k → soft / organic.
+// `Prims`. The K parameter controls joint sharpness: large K → sharp/boolean
+// look; small K → soft / organic.
+//
+// Clip is an optional primitive that the resulting field is smooth-MAX'd
+// against. The composite shape is then `(union of Prims) ∩ (interior of
+// Clip)` — i.e., the union of all primitives clipped to fit inside the clip
+// shape. Used here to wrap the strut wireframe in a rounded-cube envelope.
 type Field struct {
 	Prims []Primitive
+	Clip  Primitive
 	K     float64
 	bvh   *bvhNode // built lazily on first eval
 }
@@ -98,18 +137,28 @@ func (f *Field) Eval(p Vec3) float64 {
 	// the kernel's effective range (~3/K). Once we have a tight hard min,
 	// only nearby primitives meaningfully contribute.
 	hardMin := bvhHardMin(f.bvh, p, initial)
-	// Far-from-anything fast path: if we're well outside every primitive's
-	// kernel reach, smooth-min is numerically equal to hard-min. Skips the
-	// second BVH descent entirely (a big chunk of mostly-empty voxels).
 	if hardMin > 5.0/f.K {
-		return hardMin
+		// Far-from-anything fast path: smooth-min ≈ hard-min, skip the
+		// second BVH descent entirely.
+		v = hardMin
+	} else {
+		cutoff := hardMin + 3.0/f.K // e^{-k·(d-hardMin)} < e^-3 ≈ 0.05 past this
+		v = bvhSmoothMin(f.bvh, p, v, cutoff, f.K)
+		if v >= initial-1 {
+			v = hardMin
+		}
 	}
-	cutoff := hardMin + 3.0/f.K // beyond this, e^{-k·(d-hardMin)} < e^-3 ≈ 0.05
-	v = bvhSmoothMin(f.bvh, p, v, cutoff, f.K)
-	if v >= initial-1 {
-		// nothing contributed — return hardMin so the gradient still has a
-		// usable sign (shouldn't happen inside the build volume).
-		return hardMin
+	if f.Clip != nil {
+		// Hard max (not smooth) for the clip. The outer envelope is meant to
+		// be a sharp boundary; smoothing it would erode features whose scale
+		// is comparable to or smaller than the kernel width 3/K, which is
+		// exactly the case for the thin d6 edge fillets. The strut surface
+		// and the rounded-cube fillet are tangent at the meeting ring, so
+		// the seam is C¹ smooth in practice anyway.
+		cd := f.Clip.Dist(p)
+		if cd > v {
+			v = cd
+		}
 	}
 	return v
 }

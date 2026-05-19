@@ -2,20 +2,14 @@ package main
 
 import "math"
 
-// JointBuild is what buildSkinJoint / buildFloatingJoint return: the geometry
-// group, the "clean" interior end (where the strut body should start), and
-// the pad radius (informs webbing-support spacing).
-type JointBuild struct {
-	Mesh    *Group
-	JointEnd Vec3
-	PadR     float64
-}
-
-func buildSkinJoint(s Settings, topo *CubeTopology, anchor Vec3, inwardDir Vec3, face *CubeFace) JointBuild {
-	g := NewGroup()
-	mAnchor := newMat(Colors.SkinAnchor, true)
-	cls := topo.ClassifyBoundary(anchor, s.CubeSize/2)
-	strutR := s.StrutR
+// anchorPadR: nominal "pad radius" used by webbing/pyramid support planning
+// (spacing, min length, apex skip). We no longer emit any pad geometry, but
+// the supports still need a sensible scale around each anchor — so we keep
+// the same mult-by-cls scheme that used to drive the visible pad.
+func anchorPadR(s Settings, cls int, floating bool) float64 {
+	if floating {
+		return s.StrutR * 1.25
+	}
 	mult := 2.4
 	switch cls {
 	case 1:
@@ -23,30 +17,7 @@ func buildSkinJoint(s Settings, topo *CubeTopology, anchor Vec3, inwardDir Vec3,
 	case 2:
 		mult = 2.1
 	}
-	padR := strutR * mult
-	padThickness := strutR * 0.45
-	filletLen := strutR * 1.6
-	inward := inwardDir.Normalize()
-	outward := inward.Neg()
-	if face != nil {
-		outward = face.Normal
-	}
-	padCenter := anchor.Add(outward.Mul(padThickness * 0.15))
-	// pad cylinder along outward
-	addCylinder(g, padCenter, outward, padThickness, padR, padR*1.05, 24, mAnchor)
-	// fillet: cylinder from filletStart to filletEnd, axis = inward
-	filletStart := anchor.Add(outward.Mul(-padThickness * 0.35))
-	filletEnd := filletStart.Add(inward.Mul(filletLen))
-	filletMid := filletStart.Add(filletEnd).Mul(0.5)
-	addCylinder(g, filletMid, inward, filletLen, strutR, padR*0.92, 24, mAnchor)
-	return JointBuild{Mesh: g, JointEnd: filletEnd, PadR: padR}
-}
-
-func buildFloatingJoint(s Settings, point Vec3) JointBuild {
-	g := NewGroup()
-	mAnchor := newMat(Colors.FloatingAnchor, true)
-	addSphere(g, point, s.StrutR*1.25, 20, 14, mAnchor)
-	return JointBuild{Mesh: g, JointEnd: point, PadR: s.StrutR * 1.25}
+	return s.StrutR * mult
 }
 
 func buildSnapMarker(s Settings, point Vec3) *Group {
@@ -167,13 +138,16 @@ func buildStrut(s Settings, topo *CubeTopology, strut Strut, withHandshake bool,
 		strutColor = Colors.StrutFull
 	}
 	matStrut := newMat(strutColor, false)
-	var jointA, jointB JointBuild
+	// No more pad/fillet/bulb geometry — the strut body just runs from
+	// anchor to anchor and clips into whatever it meets (cube edges, other
+	// struts, etc). We still emit the anchor record (support planning
+	// depends on it) and the snap marker (debug aid).
 	if aOnSkin {
 		faceA := topo.FaceForBoundaryPoint(a, dirBA, half)
-		jointA = buildSkinJoint(s, topo, a, dirAB, faceA)
-		if faceA != nil && topo.ClassifyBoundary(a, half) == 1 {
+		cls := topo.ClassifyBoundary(a, half)
+		if faceA != nil && cls == 1 {
 			*anchorOut = append(*anchorOut, Anchor{
-				Anchor3D: a, PadR: jointA.PadR, Face: faceA,
+				Anchor3D: a, PadR: anchorPadR(s, cls, false), Face: faceA,
 				Kind: "skin", OwnerStrutID: strut.ID,
 			})
 		}
@@ -181,17 +155,16 @@ func buildStrut(s Settings, topo *CubeTopology, strut Strut, withHandshake bool,
 			g.Add(buildSnapMarker(s, a))
 		}
 	} else {
-		jointA = buildFloatingJoint(s, a)
 		*anchorOut = append(*anchorOut, Anchor{
-			Anchor3D: a, PadR: jointA.PadR, Kind: "floating", OwnerStrutID: strut.ID,
+			Anchor3D: a, PadR: anchorPadR(s, 0, true), Kind: "floating", OwnerStrutID: strut.ID,
 		})
 	}
 	if bOnSkin {
 		faceB := topo.FaceForBoundaryPoint(b, dirAB, half)
-		jointB = buildSkinJoint(s, topo, b, dirBA, faceB)
-		if faceB != nil && topo.ClassifyBoundary(b, half) == 1 {
+		cls := topo.ClassifyBoundary(b, half)
+		if faceB != nil && cls == 1 {
 			*anchorOut = append(*anchorOut, Anchor{
-				Anchor3D: b, PadR: jointB.PadR, Face: faceB,
+				Anchor3D: b, PadR: anchorPadR(s, cls, false), Face: faceB,
 				Kind: "skin", OwnerStrutID: strut.ID,
 			})
 		}
@@ -199,14 +172,11 @@ func buildStrut(s Settings, topo *CubeTopology, strut Strut, withHandshake bool,
 			g.Add(buildSnapMarker(s, b))
 		}
 	} else {
-		jointB = buildFloatingJoint(s, b)
 		*anchorOut = append(*anchorOut, Anchor{
-			Anchor3D: b, PadR: jointB.PadR, Kind: "floating", OwnerStrutID: strut.ID,
+			Anchor3D: b, PadR: anchorPadR(s, 0, true), Kind: "floating", OwnerStrutID: strut.ID,
 		})
 	}
-	g.Add(jointA.Mesh)
-	g.Add(jointB.Mesh)
-	cleanA, cleanB := jointA.JointEnd, jointB.JointEnd
+	cleanA, cleanB := a, b
 	cleanLen := cleanA.DistTo(cleanB)
 	cleanMid := cleanA.Add(cleanB).Mul(0.5)
 	if !withHandshake {

@@ -45,16 +45,12 @@ func BuildScene(s Settings, seed uint32) *Group {
 func buildWireframe(s Settings, topo *CubeTopology) *Group {
 	g := NewGroup()
 	mWire := newMat(Colors.Wireframe, false)
-	for _, v := range topo.Verts {
-		addSphere(g, v, s.CornerR, 24, 18, mWire)
-	}
 	for _, e := range topo.Edges {
 		a, b := e.A, e.B
 		dir := b.Sub(a)
 		l := dir.Len()
-		shrink := s.CornerR * 0.7
 		mid := a.Add(b).Mul(0.5)
-		addCylinder(g, mid, dir.Normalize(), l-shrink, s.WireR, s.WireR, 16, mWire)
+		addCylinder(g, mid, dir.Normalize(), l, s.StrutR, s.StrutR, 16, mWire)
 	}
 	return g
 }

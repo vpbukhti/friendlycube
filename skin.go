@@ -7,10 +7,14 @@ type SkinParams struct {
 	Resolution int     // marching-cubes grid resolution (per axis)
 	BlendK     float64 // smooth-min sharpness (large = sharp, small = soft)
 	Padding    float64 // extra margin around the cube AABB
+	// Fillet is the rounded-cube edge/corner radius. <=0 means "use
+	// Settings.StrutR" — so the d6 fillet visually matches the strut bodies
+	// by default.
+	Fillet float64
 }
 
 func DefaultSkinParams() SkinParams {
-	return SkinParams{Resolution: 160, BlendK: 35, Padding: 0.3}
+	return SkinParams{Resolution: 160, BlendK: 35, Padding: 0.3, Fillet: 0}
 }
 
 // BuildSkin runs the same generation pipeline as BuildScene, but emits SDF
@@ -26,12 +30,11 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	var prims []Primitive
 	handshakeRoot := NewGroup()
 
-	// Wireframe: 12 edge capsules + 8 corner spheres.
+	// Wireframe: 12 edge capsules at strut radius. No corner spheres — the
+	// three capsules meeting at each vertex just clip into one another, and
+	// smooth-min handles the visual blend.
 	for _, e := range topo.Edges {
-		prims = append(prims, Capsule{A: e.A, B: e.B, Radius: s.WireR})
-	}
-	for _, v := range topo.Verts {
-		prims = append(prims, Sphere{Center: v, Radius: s.CornerR})
+		prims = append(prims, Capsule{A: e.A, B: e.B, Radius: s.StrutR})
 	}
 
 	struts := GenerateStruts(&topo, s, seed)
@@ -64,17 +67,31 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	supports = globalSupportVsSupportPass(s, supports)
 	for _, ss := range supports {
 		prims = append(prims, Capsule{A: ss.P1, B: ss.P2, Radius: s.ButtressR})
-		beadR := s.ButtressR * 1.3
-		if ss.Kind == "pyramid" {
-			beadR = s.ButtressR * 1.4
-		}
-		prims = append(prims, Sphere{Center: ss.P2, Radius: beadR})
 	}
 
-	field := &Field{Prims: prims, K: sp.BlendK}
+	// Rounded-box envelope. Inner half-size = `half` (i.e. the cube edge
+	// axes), so the edge fillet's axis sits exactly on the cube edge axis
+	// and the corner 1/8-sphere is centered on the cube vertex. The outer
+	// flat faces are at ±(half + r) — i.e. one fillet radius beyond the
+	// cube edge axes, in the outward direction. This keeps the cube edges
+	// at their full strut girth instead of clipping them down to a thin
+	// sliver.
+	r := sp.Fillet
+	if r <= 0 {
+		r = s.StrutR
+	}
+	field := &Field{
+		Prims: prims,
+		Clip:  RoundedBox{HalfSize: V(half, half, half), R: r},
+		K:     sp.BlendK,
+	}
+	pad := sp.Padding
+	if pad < r+0.05 {
+		pad = r + 0.05
+	}
 	box := AABB{
-		Min: V(-half-sp.Padding, -half-sp.Padding, -half-sp.Padding),
-		Max: V(half+sp.Padding, half+sp.Padding, half+sp.Padding),
+		Min: V(-half-pad, -half-pad, -half-pad),
+		Max: V(half+pad, half+pad, half+pad),
 	}
 	tris := MarchingCubes(field, box, sp.Resolution)
 
@@ -92,8 +109,8 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 
 // skinStrut: SDF-mode counterpart to buildStrut. Same RNG consumption order
 // so a given seed produces matching geometry between debug and skin modes.
-// Emits SDF primitives for the strut body and joints, and the handshake
-// arms (if any) as direct triangles into handshakeRoot.
+// No ball joints — strut capsules run anchor-to-anchor and clip into the
+// wireframe / each other via the smooth-min blend.
 func skinStrut(s Settings, topo *CubeTopology, strut Strut, withHandshake bool, rand *Rand, prims *[]Primitive, handshakeRoot *Group, anchorOut *[]Anchor) {
 	half := s.CubeSize / 2
 	a, b := strut.A, strut.B
@@ -102,72 +119,36 @@ func skinStrut(s Settings, topo *CubeTopology, strut Strut, withHandshake bool, 
 	aOnSkin := topo.ClassifyBoundary(a, half) >= 1
 	bOnSkin := topo.ClassifyBoundary(b, half) >= 1
 
-	// Joint A
-	var endA Vec3
-	var padRA float64
 	if aOnSkin {
 		faceA := topo.FaceForBoundaryPoint(a, dirBA, half)
 		cls := topo.ClassifyBoundary(a, half)
-		mult := 2.4
-		switch cls {
-		case 1:
-			mult = 1.8
-		case 2:
-			mult = 2.1
-		}
-		padRA = s.StrutR * mult
-		// Joint sphere pulled slightly inward so the body capsule blends
-		// into it instead of the boundary plane.
-		jointCenter := a.Add(dirAB.Mul(s.StrutR * 0.6))
-		*prims = append(*prims, Sphere{Center: jointCenter, Radius: padRA * 0.9})
-		// "Clean" interior end where the strut body starts.
-		endA = a.Add(dirAB.Mul(s.StrutR * 1.6))
 		if faceA != nil && cls == 1 {
 			*anchorOut = append(*anchorOut, Anchor{
-				Anchor3D: a, PadR: padRA, Face: faceA, Kind: "skin", OwnerStrutID: strut.ID,
+				Anchor3D: a, PadR: anchorPadR(s, cls, false), Face: faceA,
+				Kind: "skin", OwnerStrutID: strut.ID,
 			})
 		}
 	} else {
-		padRA = s.StrutR * 1.25
-		*prims = append(*prims, Sphere{Center: a, Radius: padRA})
-		endA = a
 		*anchorOut = append(*anchorOut, Anchor{
-			Anchor3D: a, PadR: padRA, Kind: "floating", OwnerStrutID: strut.ID,
+			Anchor3D: a, PadR: anchorPadR(s, 0, true), Kind: "floating", OwnerStrutID: strut.ID,
 		})
 	}
-
-	// Joint B
-	var endB Vec3
-	var padRB float64
 	if bOnSkin {
 		faceB := topo.FaceForBoundaryPoint(b, dirAB, half)
 		cls := topo.ClassifyBoundary(b, half)
-		mult := 2.4
-		switch cls {
-		case 1:
-			mult = 1.8
-		case 2:
-			mult = 2.1
-		}
-		padRB = s.StrutR * mult
-		jointCenter := b.Add(dirBA.Mul(s.StrutR * 0.6))
-		*prims = append(*prims, Sphere{Center: jointCenter, Radius: padRB * 0.9})
-		endB = b.Add(dirBA.Mul(s.StrutR * 1.6))
 		if faceB != nil && cls == 1 {
 			*anchorOut = append(*anchorOut, Anchor{
-				Anchor3D: b, PadR: padRB, Face: faceB, Kind: "skin", OwnerStrutID: strut.ID,
+				Anchor3D: b, PadR: anchorPadR(s, cls, false), Face: faceB,
+				Kind: "skin", OwnerStrutID: strut.ID,
 			})
 		}
 	} else {
-		padRB = s.StrutR * 1.25
-		*prims = append(*prims, Sphere{Center: b, Radius: padRB})
-		endB = b
 		*anchorOut = append(*anchorOut, Anchor{
-			Anchor3D: b, PadR: padRB, Kind: "floating", OwnerStrutID: strut.ID,
+			Anchor3D: b, PadR: anchorPadR(s, 0, true), Kind: "floating", OwnerStrutID: strut.ID,
 		})
 	}
 
-	cleanA, cleanB := endA, endB
+	cleanA, cleanB := a, b
 	cleanLen := cleanA.DistTo(cleanB)
 
 	if !withHandshake {

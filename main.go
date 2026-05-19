@@ -25,9 +25,10 @@ func main() {
 	seedFlag := flag.String("seed", "", "hex seed (e.g. 1a2b3c). Empty = random.")
 	autoSpin := flag.Bool("spin", true, "auto-rotate while idle")
 	stlOnly := flag.String("stl", "", "if set, write STL to this path and exit (no window)")
-	mode := flag.String("mode", "skin", "render mode: 'debug' (per-feature mesh, colored) or 'skin' (implicit SDF + marching cubes, single skin)")
+	mode := flag.String("mode", "debug", "render mode: 'debug' (per-feature mesh, colored) or 'skin' (implicit SDF + marching cubes, single skin)")
 	mcRes := flag.Int("res", 160, "skin mode: marching-cubes grid resolution per axis")
-	blendK := flag.Float64("k", 35.0, "skin mode: smooth-min sharpness (larger = sharper joints)")
+	blendK := flag.Float64("k", 20.0, "skin mode: smooth-min sharpness (larger = sharper joints)")
+	fillet := flag.Float64("fillet", -1, "skin mode: outer rounded-cube fillet radius (edges + corners). 0 = match strut radius")
 	flag.Parse()
 
 	settings := DefaultSettings()
@@ -45,6 +46,7 @@ func main() {
 	skinParams := DefaultSkinParams()
 	skinParams.Resolution = *mcRes
 	skinParams.BlendK = *blendK
+	skinParams.Fillet = *fillet
 
 	build := func(seed uint32) *Group {
 		switch *mode {
