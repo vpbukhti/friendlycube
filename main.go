@@ -28,7 +28,8 @@ func main() {
 	mode := flag.String("mode", "debug", "render mode: 'debug' (per-feature mesh, colored) or 'skin' (implicit SDF + marching cubes, single skin)")
 	mcRes := flag.Int("res", 160, "skin mode: marching-cubes grid resolution per axis")
 	blendK := flag.Float64("k", 20.0, "skin mode: smooth-min sharpness (larger = sharper joints)")
-	fillet := flag.Float64("fillet", -1, "skin mode: outer rounded-cube fillet radius (edges + corners). 0 = match strut radius")
+	fillet := flag.Float64("fillet", 0, "skin mode: outer rounded-cube fillet radius (edges + corners). 0 = match strut radius")
+	vertexFillet := flag.Float64("vertex-fillet", 0.05, "skin mode: extra rounding at cube vertices on top of -fillet (depth of corner cut, world units). 0 = no extra vertex rounding")
 	flag.Parse()
 
 	settings := DefaultSettings()
@@ -47,6 +48,7 @@ func main() {
 	skinParams.Resolution = *mcRes
 	skinParams.BlendK = *blendK
 	skinParams.Fillet = *fillet
+	skinParams.VertexFillet = *vertexFillet
 
 	build := func(seed uint32) *Group {
 		switch *mode {

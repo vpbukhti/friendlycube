@@ -11,10 +11,17 @@ type SkinParams struct {
 	// Settings.StrutR" — so the d6 fillet visually matches the strut bodies
 	// by default.
 	Fillet float64
+	// VertexFillet adds extra rounding only at the 8 cube vertices, on top
+	// of the edge fillet. It's the depth (in world units) that a sphere
+	// centered at the cube center bites into each corner. 0 = no extra
+	// vertex rounding (corners are 1/8 spheres of edge-fillet radius).
+	// Values > half·(√3 − √2) ≈ 0.318·cubeSize/2 start eating into the
+	// edges too — that's fine if intentional, just say.
+	VertexFillet float64
 }
 
 func DefaultSkinParams() SkinParams {
-	return SkinParams{Resolution: 160, BlendK: 35, Padding: 0.3, Fillet: 0}
+	return SkinParams{Resolution: 160, BlendK: 35, Padding: 0.3, Fillet: 0, VertexFillet: 0}
 }
 
 // BuildSkin runs the same generation pipeline as BuildScene, but emits SDF
@@ -80,9 +87,19 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	if r <= 0 {
 		r = s.StrutR
 	}
+	clips := []Primitive{
+		RoundedBox{HalfSize: V(half, half, half), R: r},
+	}
+	if sp.VertexFillet > 0 {
+		// Sphere centered at the cube center, radius = (distance from center
+		// to a rounded-cube corner) − VertexFillet. The corner gets shaved
+		// by VertexFillet along the body diagonal.
+		cornerDist := math.Sqrt(3)*half + r
+		clips = append(clips, Sphere{Center: V(0, 0, 0), Radius: cornerDist - sp.VertexFillet})
+	}
 	field := &Field{
 		Prims: prims,
-		Clip:  RoundedBox{HalfSize: V(half, half, half), R: r},
+		Clips: clips,
 		K:     sp.BlendK,
 	}
 	pad := sp.Padding

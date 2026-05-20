@@ -109,13 +109,13 @@ func smax(a, b, k float64) float64 {
 // `Prims`. The K parameter controls joint sharpness: large K → sharp/boolean
 // look; small K → soft / organic.
 //
-// Clip is an optional primitive that the resulting field is smooth-MAX'd
-// against. The composite shape is then `(union of Prims) ∩ (interior of
-// Clip)` — i.e., the union of all primitives clipped to fit inside the clip
-// shape. Used here to wrap the strut wireframe in a rounded-cube envelope.
+// Clips is an optional list of primitives the field is intersected with via
+// hard-max (in order). Each entry trims the composite shape to fit inside
+// it. Used here to wrap the strut wireframe in a rounded-cube envelope and
+// (optionally) round the cube vertices further with a central sphere.
 type Field struct {
 	Prims []Primitive
-	Clip  Primitive
+	Clips []Primitive
 	K     float64
 	bvh   *bvhNode // built lazily on first eval
 }
@@ -148,14 +148,13 @@ func (f *Field) Eval(p Vec3) float64 {
 			v = hardMin
 		}
 	}
-	if f.Clip != nil {
-		// Hard max (not smooth) for the clip. The outer envelope is meant to
-		// be a sharp boundary; smoothing it would erode features whose scale
-		// is comparable to or smaller than the kernel width 3/K, which is
-		// exactly the case for the thin d6 edge fillets. The strut surface
-		// and the rounded-cube fillet are tangent at the meeting ring, so
-		// the seam is C¹ smooth in practice anyway.
-		cd := f.Clip.Dist(p)
+	// Hard max (not smooth) for clips. Outer envelopes should be sharp
+	// boundaries; smoothing would erode thin features (e.g. d6 edge fillets
+	// whose width is comparable to or smaller than the kernel 3/K). At
+	// tangent rings between the inner field and a clip surface the seam is
+	// C¹ smooth in practice anyway.
+	for _, c := range f.Clips {
+		cd := c.Dist(p)
 		if cd > v {
 			v = cd
 		}
