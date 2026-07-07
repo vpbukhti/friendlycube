@@ -26,10 +26,10 @@ func main() {
 	autoSpin := flag.Bool("spin", true, "auto-rotate while idle")
 	stlOnly := flag.String("stl", "", "if set, write STL to this path and exit (no window)")
 	mode := flag.String("mode", "debug", "render mode: 'debug' (per-feature mesh, colored) or 'skin' (implicit SDF + marching cubes, single skin)")
-	mcRes := flag.Int("res", 160, "skin mode: marching-cubes grid resolution per axis")
+	mcRes := flag.Int("res", 240, "skin mode: marching-cubes grid resolution per axis")
 	blendK := flag.Float64("k", 20.0, "skin mode: smooth-min sharpness (larger = sharper joints)")
 	fillet := flag.Float64("fillet", 0, "skin mode: outer rounded-cube fillet radius (edges + corners). 0 = match strut radius")
-	vertexFillet := flag.Float64("vertex-fillet", 0.05, "skin mode: extra rounding at cube vertices on top of -fillet (depth of corner cut, world units). 0 = no extra vertex rounding")
+	corner := flag.Float64("corner", 0.55, "skin mode: corner shape in [0, 1]. 0 = sharp miter, 0.5 = round (baseline), 1 = flat cut.")
 	flag.Parse()
 
 	settings := DefaultSettings()
@@ -48,7 +48,7 @@ func main() {
 	skinParams.Resolution = *mcRes
 	skinParams.BlendK = *blendK
 	skinParams.Fillet = *fillet
-	skinParams.VertexFillet = *vertexFillet
+	skinParams.Corner = *corner
 
 	build := func(seed uint32) *Group {
 		switch *mode {

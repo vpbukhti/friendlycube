@@ -11,17 +11,45 @@ type SkinParams struct {
 	// Settings.StrutR" — so the d6 fillet visually matches the strut bodies
 	// by default.
 	Fillet float64
-	// VertexFillet adds extra rounding only at the 8 cube vertices, on top
-	// of the edge fillet. It's the depth (in world units) that a sphere
-	// centered at the cube center bites into each corner. 0 = no extra
-	// vertex rounding (corners are 1/8 spheres of edge-fillet radius).
-	// Values > half·(√3 − √2) ≈ 0.318·cubeSize/2 start eating into the
-	// edges too — that's fine if intentional, just say.
-	VertexFillet float64
+	// Corner ∈ [0, 1] morphs each of the 8 cube corners across a single axis:
+	//   0.0 → sharpest miter (power-norm Steinmetz solid, walls flush with the
+	//         tubes, straight creases converging to a point);
+	//   0.5 → round (the natural sphere formed by the three hemispherical
+	//         capsule caps — no modification);
+	//   1.0 → flattest cut (plane perpendicular to the body diagonal, sliced
+	//         down to the vertex with a filleted rim).
+	// Below 0.5 the sharp corner solid is unioned in with a power that drops
+	// from ~40 (sharp) to ~5.4 (round). Above 0.5 material is removed by a
+	// smooth-max plane cut whose depth and fillet grow toward 1.0.
+	Corner float64
 }
 
 func DefaultSkinParams() SkinParams {
-	return SkinParams{Resolution: 160, BlendK: 35, Padding: 0.3, Fillet: 0, VertexFillet: 0}
+	return SkinParams{Resolution: 160, BlendK: 35, Padding: 0.3, Fillet: 0, Corner: 0.5}
+}
+
+// cornerMorphFromSlider maps the Corner slider ∈ [0, 1] onto a CornerMorph,
+// using the same formulas as the reference implementation.
+//   t < 0.5  (sharp → round): union a power-norm solid whose exponent falls
+//            quadratically from 128 (near-perfect miter) to 5.4 (solid has
+//            shrunk inside the baseline sphere; union is a no-op → round).
+//   t == 0.5 (round): no modification — the exact radius-r vertex sphere.
+//   t > 0.5  (round → flat): a plane cut sliding from tangent-to-the-tip
+//            (δ = r, no cut) to deep, with a rim fillet that widens with depth.
+func cornerMorphFromSlider(t float64, half, r float64) *CornerMorph {
+	cm := &CornerMorph{Half: half, R: r}
+	switch {
+	case t <= 0.495:
+		w := t * 2 // 0 = sharpest, 1 = round
+		cm.Union = true
+		cm.Power = 5.4 + 122.6*(1-w)*(1-w)
+	case t > 0.501:
+		v := (t - 0.5) * 2 // 0 = round, 1 = flattest
+		cm.Cut = true
+		cm.Delta = r - v*(r+0.2*half)
+		cm.Fillet = 1e-4 + v*(0.8*r+0.035)
+	}
+	return cm
 }
 
 // BuildSkin runs the same generation pipeline as BuildScene, but emits SDF
@@ -35,13 +63,14 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	topo := BuildCubeTopology(half)
 
 	var prims []Primitive
+	var wire []Primitive
 	handshakeRoot := NewGroup()
 
-	// Wireframe: 12 edge capsules at strut radius. No corner spheres — the
-	// three capsules meeting at each vertex just clip into one another, and
-	// smooth-min handles the visual blend.
+	// Wireframe: 12 edge capsules at strut radius. These go in their own list
+	// (hard-min'd, then corner-morphed) so the three caps meeting at each
+	// vertex form an exact radius-R sphere with no smooth-min bulge.
 	for _, e := range topo.Edges {
-		prims = append(prims, Capsule{A: e.A, B: e.B, Radius: s.StrutR})
+		wire = append(wire, Capsule{A: e.A, B: e.B, Radius: s.StrutR})
 	}
 
 	struts := GenerateStruts(&topo, s, seed)
@@ -76,31 +105,23 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 		prims = append(prims, Capsule{A: ss.P1, B: ss.P2, Radius: s.ButtressR})
 	}
 
-	// Rounded-box envelope. Inner half-size = `half` (i.e. the cube edge
-	// axes), so the edge fillet's axis sits exactly on the cube edge axis
-	// and the corner 1/8-sphere is centered on the cube vertex. The outer
-	// flat faces are at ±(half + r) — i.e. one fillet radius beyond the
-	// cube edge axes, in the outward direction. This keeps the cube edges
-	// at their full strut girth instead of clipping them down to a thin
-	// sliver.
+	// Tube radius. The corner morph reuses this as both the corner-solid
+	// radius and the plane-cut tangent depth so corners meet the tubes
+	// seamlessly. sp.Fillet <= 0 means "match the strut girth".
 	r := sp.Fillet
 	if r <= 0 {
 		r = s.StrutR
 	}
-	clips := []Primitive{
-		RoundedBox{HalfSize: V(half, half, half), R: r},
-	}
-	if sp.VertexFillet > 0 {
-		// Sphere centered at the cube center, radius = (distance from center
-		// to a rounded-cube corner) − VertexFillet. The corner gets shaved
-		// by VertexFillet along the body diagonal.
-		cornerDist := math.Sqrt(3)*half + r
-		clips = append(clips, Sphere{Center: V(0, 0, 0), Radius: cornerDist - sp.VertexFillet})
-	}
+	// No outer envelope: the wireframe is just the 12 capsules, so away from
+	// the vertices only one capsule term is ever active and the tubes stay
+	// exact cylinders of radius r. All corner shaping is confined to the 8
+	// vertices via CornerMorph, driven by the Corner slider ∈ [0, 1]:
+	//   0.0 → sharpest miter   0.5 → round (baseline)   1.0 → flattest cut.
 	field := &Field{
-		Prims: prims,
-		Clips: clips,
-		K:     sp.BlendK,
+		Prims:   prims,
+		Wire:    wire,
+		Corners: cornerMorphFromSlider(sp.Corner, half, r),
+		K:       sp.BlendK,
 	}
 	pad := sp.Padding
 	if pad < r+0.05 {
