@@ -329,6 +329,11 @@ type Field struct {
 	// eases the outer surfaces in by ≈0.25·ClipBlend as a side effect). <=0 →
 	// hard-max (a crisp crease at the skin).
 	ClipBlend float64
+	// ClipVBlend is the width over which the corner-protection ball is unioned
+	// into the clip solid. >0 → smooth-min, so the un-clipped corner region
+	// necks down into the clipped edge gradually (no crease ring around the
+	// vertex). <=0 → hard-min (a curvature crease at the ball boundary).
+	ClipVBlend float64
 	bvh       *bvhNode // built lazily on first eval (over Prims only)
 }
 
@@ -461,8 +466,13 @@ func (f *Field) Eval(p Vec3) float64 {
 		dvy := p[1] - sy*f.ClipHalf
 		dvz := p[2] - sz*f.ClipHalf
 		vball := math.Sqrt(dvx*dvx+dvy*dvy+dvz*dvz) - f.ClipVGuard
-		if vball < clip {
-			clip = vball // union the corner-protection ball into the clip solid
+		// Union the corner-protection ball into the clip solid. Smooth-min so
+		// the corner's un-clipped region necks smoothly into the clipped edge
+		// (no crease ring); hard-min otherwise.
+		if f.ClipVBlend > 0 {
+			clip = sminPoly(clip, vball, f.ClipVBlend)
+		} else if vball < clip {
+			clip = vball
 		}
 		if f.ClipBlend > 0 {
 			v = smaxPoly(v, clip, f.ClipBlend)

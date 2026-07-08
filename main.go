@@ -33,6 +33,7 @@ func main() {
 	sharp := flag.Float64("sharp", 0.2, "skin mode: smooth-anchor stiffness ratio k'/k (~0.15–0.3; keeps field C∞ at γ≠1; <=0 = kinked hard-min anchor)")
 	vguard := flag.Float64("vguard", 0, "skin mode: corner-protection ball radius where the outer edge clip is suppressed (0 = auto: 1.6×r + cap)")
 	clipBlend := flag.Float64("clipblend", -1, "skin mode: outer edge clip fillet width (<0 = auto ~0.4×r smooth join; 0 = hard crease)")
+	clipVBlend := flag.Float64("clipvblend", -0.4, "skin mode: corner→edge transition width (necks the vertex guard into the edge; <0 = auto ~r; 0 = hard)")
 	relax := flag.Int("relax", 0, "skin mode: surface-tension relaxation passes (0 = off)")
 	lambda := flag.Float64("lambda", 0.1, "skin mode: surface-tension Laplacian step per pass")
 	fillet := flag.Float64("fillet", 0, "skin mode: outer rounded-cube fillet radius (edges + corners). 0 = match strut radius")
@@ -59,6 +60,7 @@ func main() {
 	skinParams.SharpRatio = *sharp
 	skinParams.VertexGuard = *vguard
 	skinParams.ClipBlend = *clipBlend
+	skinParams.ClipVBlend = *clipVBlend
 	skinParams.Relax = *relax
 	skinParams.Lambda = *lambda
 	skinParams.Fillet = *fillet

@@ -21,6 +21,10 @@ type SkinParams struct {
 	// (concave fillet where the sleeve meets the skin, no crease); <=0 = hard
 	// crease. <0 sentinel is treated as auto (0.4×r). Only used in skin mode.
 	ClipBlend float64
+	// ClipVBlend is the width over which the corner-protection ball necks into
+	// the clipped edge (removes the crease ring around each vertex, smoothing
+	// the corner→edge transition). <0 = auto (≈r). 0 = hard. Only skin mode.
+	ClipVBlend float64
 	// Relax runs N surface-tension (constrained mean-curvature) passes on the
 	// extracted mesh; 0 disables it. Lambda is the per-pass Laplacian step.
 	Relax   int
@@ -49,8 +53,8 @@ func DefaultSkinParams() SkinParams {
 	// cube joints stay modest, B ≈ 1.4×r to cap the largest bulges.
 	return SkinParams{
 		Resolution: 160, BlendK: 0.06, Gamma: 0.6, Cap: 0.12, SharpRatio: 0.2,
-		ClipBlend: -1, // auto = 0.4×r (smooth clip)
-		Relax:     0, Lambda: 0.5, Padding: 0.3, Fillet: 0, Corner: 0.5,
+		ClipBlend: -1, ClipVBlend: -1, // auto: 0.4×r fillet, ≈r corner neck
+		Relax: 0, Lambda: 0.5, Padding: 0.3, Fillet: 0, Corner: 0.5,
 	}
 }
 
@@ -143,10 +147,11 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	// exact cylinders of radius r. All corner shaping is confined to the 8
 	// vertices via CornerMorph, driven by the Corner slider ∈ [0, 1]:
 	//   0.0 → sharpest miter   0.5 → round (baseline)   1.0 → flattest cut.
+	cm := cornerMorphFromSlider(sp.Corner, half, r)
 	field := &Field{
 		Prims:   prims,
 		Wire:    wire,
-		Corners: cornerMorphFromSlider(sp.Corner, half, r),
+		Corners: cm,
 		K:       sp.BlendK,
 		Gamma:   sp.Gamma,
 		Cap:     sp.Cap,
@@ -154,15 +159,27 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	}
 	// Outer edge clip: the cube's imagined outer skin is a rounded cube whose
 	// edges coincide with the 12 wireframe edge tubes (a quarter-cylinder of
-	// radius r around each cube edge line) and whose faces sit at half+r. Hard-
-	// cutting by it stops the sleeve bulging past the edges. The 8 vertices are
-	// left to the CornerMorph via a protection ball (auto radius covers the
-	// round corner sphere plus any crowd push-out).
+	// radius r around each cube edge line) and whose faces sit at half+r. Cutting
+	// by it stops the sleeve bulging past the edges.
+	//
+	// Vertex guard: the clip must run right up to the corners so the edge stays
+	// radius r all the way to the vertex — otherwise the near-corner edge, left
+	// un-clipped, comes out fatter than the (clip-eased) rest of the edge. So we
+	// only guard the corner where the CornerMorph actually protrudes PAST the
+	// outer skin and would be clipped away:
+	//   - flat cut (Corner > 0.5): removes material → sits inside the skin → 0
+	//   - round (Corner = 0.5): sphere of radius r = the skin's corner → 0
+	//   - sharp miter (Corner < 0.5): the only case that pokes out, along the
+	//     body diagonal to tip = r·√1.5 / 3^(1/Power) (≈1.22·r at full miter,
+	//     shrinking to r as Power drops toward round) → guard exactly that tip.
+	// (The previous 1.6·r + Cap ball guarded a huge region at every vertex,
+	// which is what made the near-corner edge visibly wider.)
 	vguard := sp.VertexGuard
 	if vguard <= 0 {
-		vguard = 1.6 * r
-		if sp.Cap > 0 {
-			vguard += sp.Cap
+		vguard = 0
+		if cm.Union { // sharp side: protect the protruding miter tip
+			tip := r * math.Sqrt(1.5) / math.Pow(3, 1.0/cm.Power)
+			vguard = 1.05 * tip
 		}
 	}
 	// ClipBlend < 0 is the "auto" sentinel: a soft fillet ~0.4×r. 0 = hard crease.
@@ -170,10 +187,16 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	if clipBlend < 0 {
 		clipBlend = 0.4 * r
 	}
+	// ClipVBlend < 0 auto: neck the corner ball into the edge over ~r.
+	clipVBlend := sp.ClipVBlend
+	if clipVBlend < 0 {
+		clipVBlend = r
+	}
 	field.OuterClip = RoundedBox{HalfSize: V(half, half, half), R: r}
 	field.ClipHalf = half
 	field.ClipVGuard = vguard
 	field.ClipBlend = clipBlend
+	field.ClipVBlend = clipVBlend
 	// The sleeve can bulge up to r + Cap past a vertex; pad the box to clear
 	// that plus a couple of cells so the isosurface never touches the boundary.
 	maxSleeve := r + 0.05
