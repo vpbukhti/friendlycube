@@ -8,6 +8,11 @@ type SkinParams struct {
 	BlendK     float64 // crowding blend reach k (a length); ~0.5–2 × StrutR
 	Gamma      float64 // crowding exponent γ; 1 = classic, <1 flattens busy joints
 	Cap        float64 // absolute joint push-out cap B; <=0 = off
+	// SharpRatio sets the smooth-anchor stiffness k' = SharpRatio × BlendK. It
+	// keeps the field C^∞ for γ≠1: smaller = a sharper (more faithful to hard-
+	// min, but less smoothed) seam; larger = seams rounded over a bigger fillet.
+	// ~0.15–0.3 is a good range. <=0 reverts to the kinked hard-min anchor.
+	SharpRatio float64
 	// Relax runs N surface-tension (constrained mean-curvature) passes on the
 	// extracted mesh; 0 disables it. Lambda is the per-pass Laplacian step.
 	Relax   int
@@ -35,7 +40,7 @@ func DefaultSkinParams() SkinParams {
 	// default StrutR (0.085): k ≈ 0.7×r for local fillets, γ<1 so the busy
 	// cube joints stay modest, B ≈ 1.4×r to cap the largest bulges.
 	return SkinParams{
-		Resolution: 160, BlendK: 0.06, Gamma: 0.6, Cap: 0.12,
+		Resolution: 160, BlendK: 0.06, Gamma: 0.6, Cap: 0.12, SharpRatio: 0.2,
 		Relax: 0, Lambda: 0.5, Padding: 0.3, Fillet: 0, Corner: 0.5,
 	}
 }
@@ -136,6 +141,7 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 		K:       sp.BlendK,
 		Gamma:   sp.Gamma,
 		Cap:     sp.Cap,
+		KSharp:  sp.SharpRatio * sp.BlendK,
 	}
 	// The sleeve can bulge up to r + Cap past a vertex; pad the box to clear
 	// that plus a couple of cells so the isosurface never touches the boundary.

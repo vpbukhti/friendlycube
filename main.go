@@ -30,6 +30,7 @@ func main() {
 	blendK := flag.Float64("k", 0.05, "skin mode: crowding blend reach k (a length; ~0.5–2 × strut radius)")
 	gamma := flag.Float64("gamma", 0.8, "skin mode: crowding exponent γ (1 = classic, <1 flattens busy joints, >1 exaggerates)")
 	capB := flag.Float64("cap", 0.12, "skin mode: absolute joint push-out cap B (<=0 = off)")
+	sharp := flag.Float64("sharp", 0.2, "skin mode: smooth-anchor stiffness ratio k'/k (~0.15–0.3; keeps field C∞ at γ≠1; <=0 = kinked hard-min anchor)")
 	relax := flag.Int("relax", 0, "skin mode: surface-tension relaxation passes (0 = off)")
 	lambda := flag.Float64("lambda", 0.1, "skin mode: surface-tension Laplacian step per pass")
 	fillet := flag.Float64("fillet", 0, "skin mode: outer rounded-cube fillet radius (edges + corners). 0 = match strut radius")
@@ -53,6 +54,7 @@ func main() {
 	skinParams.BlendK = *blendK
 	skinParams.Gamma = *gamma
 	skinParams.Cap = *capB
+	skinParams.SharpRatio = *sharp
 	skinParams.Relax = *relax
 	skinParams.Lambda = *lambda
 	skinParams.Fillet = *fillet

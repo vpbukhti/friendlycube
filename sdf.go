@@ -312,7 +312,9 @@ type Field struct {
 	K       float64  // blend reach k (a length); guidance 0.5–2 × tube radius
 	Gamma   float64  // crowding exponent γ; 1 = classic log growth, <1 flattens joints
 	Cap     float64  // absolute push-out cap B; <=0 means "effectively off"
-	bvh     *bvhNode // built lazily on first eval (over Prims only)
+	KSharp  float64  // sharp anchor stiffness k' ≪ k; the smooth stand-in for the
+	//           hard min. <=0 falls back to the hard-min anchor (kinked at γ≠1).
+	bvh *bvhNode // built lazily on first eval (over Prims only)
 }
 
 // crowdCutoff: distance (in units of k) beyond e_min past which a term's
@@ -332,12 +334,20 @@ func (f *Field) Eval(p Vec3) float64 {
 	const initial = 1e9
 	k := f.K
 
-	// --- Gather the contributors' distances into the crowding field. ---
-	// The struts/supports (Prims) each contribute one term; the whole
+	// --- Gather the contributors into the smooth crowding field. ---
+	// Each strut/support (Prims) contributes one distance term; the whole
 	// wireframe (hard-min'd + corner-morphed) contributes one further term.
-	// We need e_min and S = Σ exp(−(eᵢ−e_min)/k), so first find e_min cheaply
-	// (a hard min), then a second pass sums the exponentials of everything
-	// within crowdCutoff·k of it.
+	// Over those distances we form two log-sum-exp softmins — a soft one at the
+	// blend reach k, and a sharp one at k' ≪ k that stands in *smoothly* for
+	// the hard min. The crowding measure is x = (sm_k' − sm_k)/k, the surface
+	// anchor is sm_k', and dip = k·x^γ (capped). Because every piece is a
+	// composition of smooth functions, the field is C^∞ even for γ ≠ 1 —
+	// unlike anchoring the dip on the raw hard min, which creases along every
+	// blend seam (the fillet valleys and vertex joints). As k' → 0, sm_k' → the
+	// hard min and x → the classic ln S, recovering the earlier formulation.
+	//
+	// e_min (the true hard min) is computed only as the numerically-stable
+	// exponent offset — it cancels analytically inside both softmins.
 	eMinStrut := initial
 	if len(f.Prims) > 0 {
 		eMinStrut = bvhHardMin(f.bvh, p, initial)
@@ -359,21 +369,20 @@ func (f *Field) Eval(p Vec3) float64 {
 	eMin := math.Min(eMinStrut, w)
 
 	var v float64
-	if eMin >= initial-1 {
+	switch {
+	case eMin >= initial-1:
 		// Nothing anywhere near this point.
 		v = eMin
-	} else {
-		cutoff := eMin + crowdCutoff*k
-		// S starts at the strut/support exponential sum. bvhSumExp already
-		// includes the exp(0)=1 term for whichever strut realizes eMinStrut.
+	case f.KSharp <= 0:
+		// Fallback: anchor on the hard min (kinked at γ≠1). Kept for A/B tests.
 		s := 0.0
+		cutoff := eMin + crowdCutoff*k
 		if len(f.Prims) > 0 && eMinStrut <= cutoff {
 			s += bvhSumExp(f.bvh, p, eMin, k, cutoff)
 		}
 		if haveWire && w <= cutoff {
 			s += math.Exp(-(w - eMin) / k)
 		}
-		// S ≥ 1 always (the e_min term itself is exp(0)=1), so x = ln S ≥ 0.
 		x := 0.0
 		if s > 1 {
 			x = math.Log(s)
@@ -383,6 +392,42 @@ func (f *Field) Eval(p Vec3) float64 {
 			dip = f.Cap * math.Tanh(dip/f.Cap)
 		}
 		v = eMin - dip
+	default:
+		kp := f.KSharp
+		cutoff := eMin + crowdCutoff*k
+		// Sk  = Σ exp(−(eᵢ−eMin)/k)   (soft, reach k)
+		// Skp = Σ exp(−(eᵢ−eMin)/k')  (sharp, reach k' — the smooth hard-min)
+		// Both ≥ 1: the eMin term itself contributes exp(0)=1 to each.
+		sK, sKp := 0.0, 0.0
+		if len(f.Prims) > 0 && eMinStrut <= cutoff {
+			bK, bKp := bvhSumExp2(f.bvh, p, eMin, k, kp, cutoff)
+			sK += bK
+			sKp += bKp
+		}
+		if haveWire && w <= cutoff {
+			dw := w - eMin
+			sK += math.Exp(-dw / k)
+			sKp += math.Exp(-dw / kp)
+		}
+		lnSK, lnSKp := 0.0, 0.0
+		if sK > 1 {
+			lnSK = math.Log(sK)
+		}
+		if sKp > 1 {
+			lnSKp = math.Log(sKp)
+		}
+		// Smooth sharp anchor sm_k' = eMin − k'·ln Skp (hard eMin cancels).
+		smKp := eMin - kp*lnSKp
+		// Crowding x = (sm_k' − sm_k)/k = ln Sk − (k'/k)·ln Skp ≥ 0.
+		x := lnSK - (kp/k)*lnSKp
+		if x < 0 {
+			x = 0
+		}
+		dip := k * math.Pow(x, f.Gamma)
+		if f.Cap > 0 {
+			dip = f.Cap * math.Tanh(dip/f.Cap)
+		}
+		v = smKp - dip
 	}
 	// Hard max (not smooth) for clips. Outer envelopes should be sharp
 	// boundaries; smoothing would erode thin features (e.g. d6 edge fillets
@@ -552,4 +597,34 @@ func bvhSumExp(n *bvhNode, p Vec3, eMin, k, cutoff float64) float64 {
 		return sum
 	}
 	return bvhSumExp(n.left, p, eMin, k, cutoff) + bvhSumExp(n.right, p, eMin, k, cutoff)
+}
+
+// bvhSumExp2 is bvhSumExp accumulating two log-sum-exp sums in one traversal:
+// one at stiffness k (soft) and one at k' (sharp). Each primitive's SDF is
+// evaluated once. Returns (Σ exp(−(dᵢ−eMin)/k), Σ exp(−(dᵢ−eMin)/k')). The
+// cutoff is in k units (k > k'), so it conservatively covers both sums — a
+// term dropped for k contributes even less at the sharper k'.
+func bvhSumExp2(n *bvhNode, p Vec3, eMin, k, kp, cutoff float64) (float64, float64) {
+	if n == nil {
+		return 0, 0
+	}
+	if distToAABB(p, n.box) > cutoff {
+		return 0, 0
+	}
+	if n.prims != nil {
+		var sumK, sumKp float64
+		for _, pr := range n.prims {
+			d := pr.Dist(p)
+			if d > cutoff {
+				continue
+			}
+			dd := d - eMin
+			sumK += math.Exp(-dd / k)
+			sumKp += math.Exp(-dd / kp)
+		}
+		return sumK, sumKp
+	}
+	lK, lKp := bvhSumExp2(n.left, p, eMin, k, kp, cutoff)
+	rK, rKp := bvhSumExp2(n.right, p, eMin, k, kp, cutoff)
+	return lK + rK, lKp + rKp
 }
