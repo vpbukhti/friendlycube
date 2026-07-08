@@ -27,7 +27,11 @@ func main() {
 	stlOnly := flag.String("stl", "", "if set, write STL to this path and exit (no window)")
 	mode := flag.String("mode", "debug", "render mode: 'debug' (per-feature mesh, colored) or 'skin' (implicit SDF + marching cubes, single skin)")
 	mcRes := flag.Int("res", 240, "skin mode: marching-cubes grid resolution per axis")
-	blendK := flag.Float64("k", 20.0, "skin mode: smooth-min sharpness (larger = sharper joints)")
+	blendK := flag.Float64("k", 0.06, "skin mode: crowding blend reach k (a length; ~0.5–2 × strut radius)")
+	gamma := flag.Float64("gamma", 0.6, "skin mode: crowding exponent γ (1 = classic, <1 flattens busy joints, >1 exaggerates)")
+	capB := flag.Float64("cap", 0.12, "skin mode: absolute joint push-out cap B (<=0 = off)")
+	relax := flag.Int("relax", 0, "skin mode: surface-tension relaxation passes (0 = off)")
+	lambda := flag.Float64("lambda", 0.5, "skin mode: surface-tension Laplacian step per pass")
 	fillet := flag.Float64("fillet", 0, "skin mode: outer rounded-cube fillet radius (edges + corners). 0 = match strut radius")
 	corner := flag.Float64("corner", 0.55, "skin mode: corner shape in [0, 1]. 0 = sharp miter, 0.5 = round (baseline), 1 = flat cut.")
 	flag.Parse()
@@ -47,6 +51,10 @@ func main() {
 	skinParams := DefaultSkinParams()
 	skinParams.Resolution = *mcRes
 	skinParams.BlendK = *blendK
+	skinParams.Gamma = *gamma
+	skinParams.Cap = *capB
+	skinParams.Relax = *relax
+	skinParams.Lambda = *lambda
 	skinParams.Fillet = *fillet
 	skinParams.Corner = *corner
 

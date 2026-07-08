@@ -5,8 +5,14 @@ import "math"
 // SkinParams controls the implicit-skin mesher behavior.
 type SkinParams struct {
 	Resolution int     // marching-cubes grid resolution (per axis)
-	BlendK     float64 // smooth-min sharpness (large = sharp, small = soft)
-	Padding    float64 // extra margin around the cube AABB
+	BlendK     float64 // crowding blend reach k (a length); ~0.5–2 × StrutR
+	Gamma      float64 // crowding exponent γ; 1 = classic, <1 flattens busy joints
+	Cap        float64 // absolute joint push-out cap B; <=0 = off
+	// Relax runs N surface-tension (constrained mean-curvature) passes on the
+	// extracted mesh; 0 disables it. Lambda is the per-pass Laplacian step.
+	Relax   int
+	Lambda  float64
+	Padding float64 // extra margin around the cube AABB
 	// Fillet is the rounded-cube edge/corner radius. <=0 means "use
 	// Settings.StrutR" — so the d6 fillet visually matches the strut bodies
 	// by default.
@@ -25,7 +31,13 @@ type SkinParams struct {
 }
 
 func DefaultSkinParams() SkinParams {
-	return SkinParams{Resolution: 160, BlendK: 35, Padding: 0.3, Fillet: 0, Corner: 0.5}
+	// BlendK/Gamma/Cap are the organic-sleeve knobs. Defaults tuned around the
+	// default StrutR (0.085): k ≈ 0.7×r for local fillets, γ<1 so the busy
+	// cube joints stay modest, B ≈ 1.4×r to cap the largest bulges.
+	return SkinParams{
+		Resolution: 160, BlendK: 0.06, Gamma: 0.6, Cap: 0.12,
+		Relax: 0, Lambda: 0.5, Padding: 0.3, Fillet: 0, Corner: 0.5,
+	}
 }
 
 // cornerMorphFromSlider maps the Corner slider ∈ [0, 1] onto a CornerMorph,
@@ -122,16 +134,32 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 		Wire:    wire,
 		Corners: cornerMorphFromSlider(sp.Corner, half, r),
 		K:       sp.BlendK,
+		Gamma:   sp.Gamma,
+		Cap:     sp.Cap,
+	}
+	// The sleeve can bulge up to r + Cap past a vertex; pad the box to clear
+	// that plus a couple of cells so the isosurface never touches the boundary.
+	maxSleeve := r + 0.05
+	if sp.Cap > 0 {
+		maxSleeve += sp.Cap
 	}
 	pad := sp.Padding
-	if pad < r+0.05 {
-		pad = r + 0.05
+	if pad < maxSleeve {
+		pad = maxSleeve
 	}
 	box := AABB{
 		Min: V(-half-pad, -half-pad, -half-pad),
 		Max: V(half+pad, half+pad, half+pad),
 	}
 	tris := MarchingCubes(field, box, sp.Resolution)
+
+	// Optional surface-tension pass: relax the mesh toward a taut, concave
+	// fillet while keeping every vertex outside the tube skeleton (the tubes
+	// act as the film's wire frame). See organic_sleeve_method.md Step 6.
+	if sp.Relax > 0 {
+		tubes := collectTubes(prims, wire)
+		tris = relaxSurfaceTension(tris, tubes, sp.Relax, sp.Lambda)
+	}
 
 	// Render skin as a single material — a warm off-white in the spirit of
 	// polished marble. (User intends to retouch in Blender.)

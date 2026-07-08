@@ -270,9 +270,21 @@ func (cm *CornerMorph) apply(p Vec3, f float64) float64 {
 	return f
 }
 
-// Field is the signed-distance function that smooth-mins every primitive in
-// `Prims`. The K parameter controls joint sharpness: large K → sharp/boolean
-// look; small K → soft / organic.
+// Field is the signed-distance function that combines every primitive in
+// `Prims` with the "organic sleeve" crowding field (see
+// organic_sleeve_method.md), the generalization of the exponential smooth-min:
+//
+//	e_min = minᵢ eᵢ                              (hard union of the tubes)
+//	S     = Σᵢ exp( −(eᵢ − e_min) / k )          (effective contributor count)
+//	dip   = k · (ln S)^γ                          (crowding push-out)
+//	D     = e_min − B · tanh( dip / B )           (cap the push-out at B)
+//
+// The classic log-sum-exp smooth-min is exactly the γ=1, B=∞ case. The two
+// extra knobs are the point of the rework:
+//   - K  (a length, "blend reach") — how far apart / far along tubes still merge.
+//   - Gamma — how blend depth grows with the number of contributing tubes.
+//     <1 flattens busy high-valence joints while keeping pairwise fillets full.
+//   - Cap (B) — a hard tanh ceiling on how far any joint may bulge past the tube.
 //
 // Clips is an optional list of primitives the field is intersected with via
 // hard-max (in order). Each entry trims the composite shape to fit inside
@@ -284,21 +296,28 @@ func (cm *CornerMorph) apply(p Vec3, f float64) float64 {
 type Field struct {
 	Prims []Primitive
 	// Wire holds the 12 wireframe edge capsules. They are combined with a HARD
-	// min (not the exponential smooth-min), so the three hemispherical caps
-	// meeting at each cube vertex coincide into an exact sphere of radius R —
-	// no smooth-min puff/bulge. Corner morphing (below) is then applied to this
-	// hard-min wireframe field, matching the reference implementation. The
-	// wireframe field is finally smooth-min'd with the strut field (Prims) so
-	// strut↔frame joints still fillet.
+	// min (not the crowding field), so the three hemispherical caps meeting at
+	// each cube vertex coincide into an exact sphere of radius R — no puff. The
+	// corner morph (below) is then applied to this hard-min wireframe field.
+	// The morphed wireframe distance enters the crowding field as a SINGLE
+	// contributor term alongside the struts, so strut↔frame joints still fillet
+	// by the same crowding rule, while bare cube corners (where only the wire
+	// term is active, S≈1, dip≈0) keep their exact morphed shape.
 	Wire []Primitive
 	// Corners, if set, morphs the wireframe field at the 8 cube vertices
 	// (sharp ↔ round ↔ flat).
 	Corners *CornerMorph
 	Clips   []Primitive
 	Subs    []Primitive
-	K       float64
+	K       float64  // blend reach k (a length); guidance 0.5–2 × tube radius
+	Gamma   float64  // crowding exponent γ; 1 = classic log growth, <1 flattens joints
+	Cap     float64  // absolute push-out cap B; <=0 means "effectively off"
 	bvh     *bvhNode // built lazily on first eval (over Prims only)
 }
+
+// crowdCutoff: distance (in units of k) beyond e_min past which a term's
+// exp(−Δ/k) is negligible. exp(−18) ≈ 1.5e-8, below single-float resolution.
+const crowdCutoff = 18.0
 
 // Build eagerly constructs the BVH so concurrent Eval callers don't race.
 // Idempotent.
@@ -311,30 +330,22 @@ func (f *Field) Build() {
 
 func (f *Field) Eval(p Vec3) float64 {
 	const initial = 1e9
-	v := initial
-	// We seed with a hard min from the BVH to cull primitives whose bounding
-	// boxes are far enough that they can't influence the smooth-min within
-	// the kernel's effective range (~3/K). Once we have a tight hard min,
-	// only nearby primitives meaningfully contribute.
+	k := f.K
+
+	// --- Gather the contributors' distances into the crowding field. ---
+	// The struts/supports (Prims) each contribute one term; the whole
+	// wireframe (hard-min'd + corner-morphed) contributes one further term.
+	// We need e_min and S = Σ exp(−(eᵢ−e_min)/k), so first find e_min cheaply
+	// (a hard min), then a second pass sums the exponentials of everything
+	// within crowdCutoff·k of it.
+	eMinStrut := initial
 	if len(f.Prims) > 0 {
-		hardMin := bvhHardMin(f.bvh, p, initial)
-		if hardMin > 5.0/f.K {
-			// Far-from-anything fast path: smooth-min ≈ hard-min, skip the
-			// second BVH descent entirely.
-			v = hardMin
-		} else {
-			cutoff := hardMin + 3.0/f.K // e^{-k·(d-hardMin)} < e^-3 ≈ 0.05 past this
-			v = bvhSmoothMin(f.bvh, p, v, cutoff, f.K)
-			if v >= initial-1 {
-				v = hardMin
-			}
-		}
+		eMinStrut = bvhHardMin(f.bvh, p, initial)
 	}
-	// Wireframe: hard-min the 12 edge capsules (so vertices are exact spheres,
-	// no smooth-min puff), morph the corners, then smooth-min the result into
-	// the strut field so strut↔frame joints still fillet.
-	if len(f.Wire) > 0 {
-		w := initial
+
+	haveWire := len(f.Wire) > 0
+	w := initial
+	if haveWire {
 		for _, wc := range f.Wire {
 			if d := wc.Dist(p); d < w {
 				w = d
@@ -343,7 +354,35 @@ func (f *Field) Eval(p Vec3) float64 {
 		if f.Corners != nil {
 			w = f.Corners.apply(p, w)
 		}
-		v = smin(v, w, f.K)
+	}
+
+	eMin := math.Min(eMinStrut, w)
+
+	var v float64
+	if eMin >= initial-1 {
+		// Nothing anywhere near this point.
+		v = eMin
+	} else {
+		cutoff := eMin + crowdCutoff*k
+		// S starts at the strut/support exponential sum. bvhSumExp already
+		// includes the exp(0)=1 term for whichever strut realizes eMinStrut.
+		s := 0.0
+		if len(f.Prims) > 0 && eMinStrut <= cutoff {
+			s += bvhSumExp(f.bvh, p, eMin, k, cutoff)
+		}
+		if haveWire && w <= cutoff {
+			s += math.Exp(-(w - eMin) / k)
+		}
+		// S ≥ 1 always (the e_min term itself is exp(0)=1), so x = ln S ≥ 0.
+		x := 0.0
+		if s > 1 {
+			x = math.Log(s)
+		}
+		dip := k * math.Pow(x, f.Gamma)
+		if f.Cap > 0 {
+			dip = f.Cap * math.Tanh(dip/f.Cap)
+		}
+		v = eMin - dip
 	}
 	// Hard max (not smooth) for clips. Outer envelopes should be sharp
 	// boundaries; smoothing would erode thin features (e.g. d6 edge fillets
@@ -488,26 +527,29 @@ func bvhHardMin(n *bvhNode, p Vec3, current float64) float64 {
 	return current
 }
 
-func bvhSmoothMin(n *bvhNode, p Vec3, current, cutoff, k float64) float64 {
+// bvhSumExp accumulates Σ exp(−(dᵢ−eMin)/k) over every primitive whose SDF is
+// within `cutoff` of eMin, using the box distance as a conservative lower
+// bound to prune whole subtrees. eMin must be the true minimum SDF over the
+// same primitive set (so every exponent is ≤ 0 and nothing overflows).
+func bvhSumExp(n *bvhNode, p Vec3, eMin, k, cutoff float64) float64 {
 	if n == nil {
-		return current
+		return 0
 	}
-	// Conservative cull: if the box is farther than cutoff, no primitive in
-	// it can be within the smooth-min kernel's effective support.
+	// Conservative cull: distToAABB is a lower bound on any contained
+	// primitive's SDF, so if the box is beyond cutoff none can contribute.
 	if distToAABB(p, n.box) > cutoff {
-		return current
+		return 0
 	}
 	if n.prims != nil {
+		sum := 0.0
 		for _, pr := range n.prims {
 			d := pr.Dist(p)
 			if d > cutoff {
 				continue
 			}
-			current = smin(current, d, k)
+			sum += math.Exp(-(d - eMin) / k)
 		}
-		return current
+		return sum
 	}
-	current = bvhSmoothMin(n.left, p, current, cutoff, k)
-	current = bvhSmoothMin(n.right, p, current, cutoff, k)
-	return current
+	return bvhSumExp(n.left, p, eMin, k, cutoff) + bvhSumExp(n.right, p, eMin, k, cutoff)
 }
