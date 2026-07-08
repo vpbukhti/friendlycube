@@ -13,6 +13,14 @@ type SkinParams struct {
 	// min, but less smoothed) seam; larger = seams rounded over a bigger fillet.
 	// ~0.15–0.3 is a good range. <=0 reverts to the kinked hard-min anchor.
 	SharpRatio float64
+	// VertexGuard is the radius of the corner-protection ball around each cube
+	// vertex where the outer edge clip is suppressed (so the CornerMorph rules
+	// the corners). <=0 = auto (1.6×r + Cap). Only used in skin mode.
+	VertexGuard float64
+	// ClipBlend is the fillet width of the outer edge clip. >0 = smooth join
+	// (concave fillet where the sleeve meets the skin, no crease); <=0 = hard
+	// crease. <0 sentinel is treated as auto (0.4×r). Only used in skin mode.
+	ClipBlend float64
 	// Relax runs N surface-tension (constrained mean-curvature) passes on the
 	// extracted mesh; 0 disables it. Lambda is the per-pass Laplacian step.
 	Relax   int
@@ -41,7 +49,8 @@ func DefaultSkinParams() SkinParams {
 	// cube joints stay modest, B ≈ 1.4×r to cap the largest bulges.
 	return SkinParams{
 		Resolution: 160, BlendK: 0.06, Gamma: 0.6, Cap: 0.12, SharpRatio: 0.2,
-		Relax: 0, Lambda: 0.5, Padding: 0.3, Fillet: 0, Corner: 0.5,
+		ClipBlend: -1, // auto = 0.4×r (smooth clip)
+		Relax:     0, Lambda: 0.5, Padding: 0.3, Fillet: 0, Corner: 0.5,
 	}
 }
 
@@ -143,6 +152,28 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 		Cap:     sp.Cap,
 		KSharp:  sp.SharpRatio * sp.BlendK,
 	}
+	// Outer edge clip: the cube's imagined outer skin is a rounded cube whose
+	// edges coincide with the 12 wireframe edge tubes (a quarter-cylinder of
+	// radius r around each cube edge line) and whose faces sit at half+r. Hard-
+	// cutting by it stops the sleeve bulging past the edges. The 8 vertices are
+	// left to the CornerMorph via a protection ball (auto radius covers the
+	// round corner sphere plus any crowd push-out).
+	vguard := sp.VertexGuard
+	if vguard <= 0 {
+		vguard = 1.6 * r
+		if sp.Cap > 0 {
+			vguard += sp.Cap
+		}
+	}
+	// ClipBlend < 0 is the "auto" sentinel: a soft fillet ~0.4×r. 0 = hard crease.
+	clipBlend := sp.ClipBlend
+	if clipBlend < 0 {
+		clipBlend = 0.4 * r
+	}
+	field.OuterClip = RoundedBox{HalfSize: V(half, half, half), R: r}
+	field.ClipHalf = half
+	field.ClipVGuard = vguard
+	field.ClipBlend = clipBlend
 	// The sleeve can bulge up to r + Cap past a vertex; pad the box to clear
 	// that plus a couple of cells so the isosurface never touches the boundary.
 	maxSleeve := r + 0.05

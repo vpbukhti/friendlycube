@@ -314,7 +314,22 @@ type Field struct {
 	Cap     float64  // absolute push-out cap B; <=0 means "effectively off"
 	KSharp  float64  // sharp anchor stiffness k' ≪ k; the smooth stand-in for the
 	//           hard min. <=0 falls back to the hard-min anchor (kinked at γ≠1).
-	bvh *bvhNode // built lazily on first eval (over Prims only)
+	// OuterClip hard-cuts the composite field to the cube's imagined outer skin
+	// (typically a RoundedBox whose edges are the wireframe edge tubes) so the
+	// sleeve cannot bulge past the cube edges. It is unioned with a protective
+	// ball of radius ClipVGuard around the nearest cube vertex (vertices sit at
+	// ±ClipHalf on each axis) so the CornerMorph keeps governing the corners
+	// untouched, with a seamless transition. Nil = no outer clip.
+	OuterClip  Primitive
+	ClipHalf   float64
+	ClipVGuard float64
+	// ClipBlend is the fillet width of the outer clip's intersection with the
+	// sleeve. >0 → smooth-max (a concave fillet where the sleeve meets the skin,
+	// C¹ continuous, always ≥ a hard cut so the edges are still fully clipped;
+	// eases the outer surfaces in by ≈0.25·ClipBlend as a side effect). <=0 →
+	// hard-max (a crisp crease at the skin).
+	ClipBlend float64
+	bvh       *bvhNode // built lazily on first eval (over Prims only)
 }
 
 // crowdCutoff: distance (in units of k) beyond e_min past which a term's
@@ -428,6 +443,32 @@ func (f *Field) Eval(p Vec3) float64 {
 			dip = f.Cap * math.Tanh(dip/f.Cap)
 		}
 		v = smKp - dip
+	}
+	// Outer edge clip: ease the field down to the cube's imagined outer skin
+	// (a rounded cube whose edges ARE the wireframe edge tubes), so the sleeve
+	// can't bulge past the cube edges. A ball of radius ClipVGuard around the
+	// nearest cube vertex is unioned into the clip solid, so the CornerMorph
+	// continues to govern the corners untouched — and because that ball is a
+	// smooth part of the clip SDF, the clip fades in seamlessly rather than
+	// switching on at a hard boundary. The join itself is a smooth intersection
+	// (smaxPoly) so the sleeve meets the skin with a concave fillet rather than
+	// a crease, staying C¹ and continuous, while still clipping fully (smaxPoly
+	// ≥ hard max, so nothing survives outside the skin).
+	if f.OuterClip != nil {
+		clip := f.OuterClip.Dist(p)
+		sx, sy, sz := signF(p[0]), signF(p[1]), signF(p[2])
+		dvx := p[0] - sx*f.ClipHalf
+		dvy := p[1] - sy*f.ClipHalf
+		dvz := p[2] - sz*f.ClipHalf
+		vball := math.Sqrt(dvx*dvx+dvy*dvy+dvz*dvz) - f.ClipVGuard
+		if vball < clip {
+			clip = vball // union the corner-protection ball into the clip solid
+		}
+		if f.ClipBlend > 0 {
+			v = smaxPoly(v, clip, f.ClipBlend)
+		} else if clip > v {
+			v = clip // hard intersection: crisp crease at the skin
+		}
 	}
 	// Hard max (not smooth) for clips. Outer envelopes should be sharp
 	// boundaries; smoothing would erode thin features (e.g. d6 edge fillets
