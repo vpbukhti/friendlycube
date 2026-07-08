@@ -181,13 +181,24 @@ const bg=[0x1a/255,0x1a/255,0x1c/255];
 const lightDirs=new Float32Array([-5,-8,-4, 4,-2,3, 0,4,5]);
 const lightCols=new Float32Array([0.9,0.864,0.792, 0.316,0.34,0.3645, 0.3,0.273,0.231]);
 
-// interaction
-let rotX=0.3, rotY=0.6, zoom=1, dragging=false, lastX=0, lastY=0;
-canvas.addEventListener('mousedown',e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;});
+// interaction — trackball: orientation is an accumulated rotation matrix, and
+// drags compose incremental rotations about the camera's screen axes. No Euler
+// angles → no gimbal lock and no rotation limits (free tumbling any direction).
+// Inertia: while dragging it chases the pointer quickly (low inertia); on
+// release it keeps the flung momentum and coasts to a stop (higher inertia).
+let orient=null;                    // rotation mat4, set in init once helpers exist
+let velYaw=0, velPitch=0;           // angular velocity (rad/s) about screen up / right
+let pendYaw=0, pendPitch=0;         // pointer motion not yet consumed by a frame
+let zoom=1, dragging=false, lastX=0, lastY=0;
+const GAIN=0.008;          // mouse pixels → radians
+const DRAG_FOLLOW=22;      // how fast rotation chases the pointer while dragging (higher = less inertia)
+const RELEASE_FRICTION=1.8;// how fast the throw decays after release (lower = more inertia / longer coast)
+const MAX_VEL=7;           // clamp fling speed (rad/s)
+canvas.addEventListener('mousedown',e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;velYaw=0;velPitch=0;pendYaw=0;pendPitch=0;});
 window.addEventListener('mouseup',()=>dragging=false);
 window.addEventListener('mousemove',e=>{if(!dragging)return;
-  rotY+=(e.clientX-lastX)*0.008; rotX+=(e.clientY-lastY)*0.008;
-  rotX=Math.max(-1.5,Math.min(1.5,rotX)); lastX=e.clientX; lastY=e.clientY;});
+  pendYaw+=(e.clientX-lastX)*GAIN; pendPitch+=(e.clientY-lastY)*GAIN;
+  lastX=e.clientX; lastY=e.clientY;});
 canvas.addEventListener('wheel',e=>{e.preventDefault();
   zoom*=Math.exp(e.deltaY*0.0011); zoom=Math.max(0.35,Math.min(4,zoom));},{passive:false});
 
@@ -204,7 +215,26 @@ function m4lookAt(e,c,u){const z=norm(sub(e,c)),x=norm(cross(u,z)),y=cross(z,x);
   return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,e),-dot(y,e),-dot(z,e),1]);}
 function m4rotX(a){const c=Math.cos(a),s=Math.sin(a);return new Float32Array([1,0,0,0,0,c,s,0,0,-s,c,0,0,0,0,1]);}
 function m4rotY(a){const c=Math.cos(a),s=Math.sin(a);return new Float32Array([c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1]);}
+// Rotation about an arbitrary unit axis (Rodrigues), column-major.
+function m4axis(ax,ang){const x=ax[0],y=ax[1],z=ax[2],c=Math.cos(ang),s=Math.sin(ang),t=1-c;
+  return new Float32Array([
+    t*x*x+c,   t*x*y+s*z, t*x*z-s*y, 0,
+    t*x*y-s*z, t*y*y+c,   t*y*z+s*x, 0,
+    t*x*z+s*y, t*y*z-s*x, t*z*z+c,   0,
+    0,0,0,1]);}
 const camBase=[4.2,2.8,5.0];
+// Camera screen axes in world space (constant — zoom only slides along camDir).
+const camDir=norm(camBase);
+const camRight=norm(cross([0,1,0],camDir));
+const camUp=cross(camDir,camRight);
+// Apply a yaw (about screen up) then pitch (about screen right) to the
+// orientation, in world space (pre-multiply). Small per-frame angles.
+function tumble(yaw,pitch){
+  orient=m4mul(m4axis(camUp,yaw),orient);
+  orient=m4mul(m4axis(camRight,pitch),orient);
+}
+// initial pose ≈ the old default view
+orient=m4mul(m4rotX(0.3),m4rotY(0.6));
 
 async function loadMesh(){
   const resp=await fetch('/api/mesh'); const buf=await resp.arrayBuffer();
@@ -228,8 +258,24 @@ function resize(){
 }
 let last=performance.now();
 function frame(now){
-  const dt=(now-last)/1000; last=now;
-  if(spin&&!dragging) rotY+=0.4*dt;
+  const dt=Math.min((now-last)/1000,0.05); last=now;
+  if(dragging){
+    // Consume a fraction of the pending pointer motion (eased → a little
+    // weight), carry the rest, and read velocity off what we applied so a
+    // release can fling it.
+    const a=1-Math.exp(-DRAG_FOLLOW*dt);
+    const ay=pendYaw*a, ap=pendPitch*a;
+    tumble(ay,ap);
+    pendYaw-=ay; pendPitch-=ap;
+    if(dt>0){ velYaw=ay/dt; velPitch=ap/dt; }
+    velYaw=Math.max(-MAX_VEL,Math.min(MAX_VEL,velYaw));
+    velPitch=Math.max(-MAX_VEL,Math.min(MAX_VEL,velPitch));
+  }else{
+    const baseYaw=spin?0.4*dt:0;            // baseline idle spin about screen up
+    tumble(velYaw*dt+baseYaw, velPitch*dt); // coasting momentum on top
+    const decay=Math.exp(-RELEASE_FRICTION*dt);
+    velYaw*=decay; velPitch*=decay;
+  }
   resize();
   gl.viewport(0,0,canvas.width,canvas.height);
   gl.clearColor(bg[0],bg[1],bg[2],1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
@@ -238,7 +284,7 @@ function frame(now){
     const proj=m4persp(38*Math.PI/180,asp,0.1,100);
     const eye=[camBase[0]*zoom,camBase[1]*zoom,camBase[2]*zoom];
     const view=m4lookAt(eye,[0,0,0],[0,1,0]);
-    const model=m4mul(m4rotX(rotX),m4rotY(rotY));
+    const model=orient;
     const mvp=m4mul(proj,m4mul(view,model));
     const nm=new Float32Array([model[0],model[1],model[2],model[4],model[5],model[6],model[8],model[9],model[10]]);
     gl.useProgram(prog);
