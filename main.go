@@ -4,212 +4,77 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math/rand/v2"
 	"os"
+	"os/exec"
 	"runtime"
-	"time"
 
-	"github.com/go-gl/gl/v4.1-core/gl"
-	"github.com/go-gl/glfw/v3.3/glfw"
-	"github.com/go-gl/mathgl/mgl32"
+	"friendlycube/internal/control"
+	"friendlycube/internal/engine"
 )
 
-const winW, winH = 1100, 760
-
-func init() {
-	// GLFW must run on the main OS thread on Mac.
-	runtime.LockOSThread()
-}
-
 func main() {
-	seedFlag := flag.String("seed", "", "hex seed (e.g. 1a2b3c). Empty = random.")
-	autoSpin := flag.Bool("spin", true, "auto-rotate while idle")
-	stlOnly := flag.String("stl", "", "if set, write STL to this path and exit (no window)")
-	mode := flag.String("mode", "debug", "render mode: 'debug' (per-feature mesh, colored) or 'skin' (implicit SDF + marching cubes, single skin)")
-	mcRes := flag.Int("res", 240, "skin mode: marching-cubes grid resolution per axis")
-	blendK := flag.Float64("k", 0.05, "skin mode: crowding blend reach k (a length; ~0.5–2 × strut radius)")
-	gamma := flag.Float64("gamma", 0.8, "skin mode: crowding exponent γ (1 = classic, <1 flattens busy joints, >1 exaggerates)")
-	capB := flag.Float64("cap", 0.12, "skin mode: absolute joint push-out cap B (<=0 = off)")
-	sharp := flag.Float64("sharp", 0.2, "skin mode: smooth-anchor stiffness ratio k'/k (~0.15–0.3; keeps field C∞ at γ≠1; <=0 = kinked hard-min anchor)")
-	vguard := flag.Float64("vguard", 0, "skin mode: corner-protection ball radius where the outer edge clip is suppressed (0 = auto: 1.6×r + cap)")
-	clipBlend := flag.Float64("clipblend", -1, "skin mode: outer edge clip fillet width (<0 = auto ~0.4×r smooth join; 0 = hard crease)")
-	clipVBlend := flag.Float64("clipvblend", -0.4, "skin mode: corner→edge transition width (necks the vertex guard into the edge; <0 = auto ~r; 0 = hard)")
-	relax := flag.Int("relax", 0, "skin mode: surface-tension relaxation passes (0 = off)")
-	lambda := flag.Float64("lambda", 0.1, "skin mode: surface-tension Laplacian step per pass")
-	fillet := flag.Float64("fillet", 0, "skin mode: outer rounded-cube fillet radius (edges + corners). 0 = match strut radius")
-	corner := flag.Float64("corner", 0.62, "skin mode: corner shape in [0, 1]. 0 = sharp miter, 0.5 = round (baseline), 1 = flat cut.")
+	configPath := flag.String("config", "config.default.json", "path to a JSON config (absent keys / null → baked-in defaults)")
+	seedFlag := flag.String("seed", "", "hex seed override (e.g. 1a2b3c). Empty = use config / random.")
+	stlOnly := flag.String("stl", "", "if set, write STL to this path (headless) and exit")
+	addr := flag.String("addr", "127.0.0.1:8730", "address for the control-panel + WebGL web server")
+	open := flag.Bool("open", true, "open the panel in the default browser on start")
 	flag.Parse()
 
-	settings := DefaultSettings()
-	var currentSeed uint32
+	// Config: start from baked-in defaults, overlay the file if present.
+	cfg := control.DefaultConfig()
+	if *configPath != "" {
+		if loaded, err := control.LoadConfig(*configPath); err != nil {
+			if !os.IsNotExist(err) {
+				log.Fatalf("config %s: %v", *configPath, err)
+			}
+			log.Printf("config %s not found — using baked-in defaults", *configPath)
+		} else {
+			cfg = loaded
+		}
+	}
 	if *seedFlag != "" {
-		s, err := parseHexSeed(*seedFlag)
-		if err != nil {
-			log.Fatalf("bad seed: %v", err)
-		}
-		currentSeed = s
-	} else {
-		currentSeed = uint32(rand.Uint32() & 0xffffff)
+		cfg.Seed = *seedFlag
 	}
 
-	skinParams := DefaultSkinParams()
-	skinParams.Resolution = *mcRes
-	skinParams.BlendK = *blendK
-	skinParams.Gamma = *gamma
-	skinParams.Cap = *capB
-	skinParams.SharpRatio = *sharp
-	skinParams.VertexGuard = *vguard
-	skinParams.ClipBlend = *clipBlend
-	skinParams.ClipVBlend = *clipVBlend
-	skinParams.Relax = *relax
-	skinParams.Lambda = *lambda
-	skinParams.Fillet = *fillet
-	skinParams.Corner = *corner
-
-	build := func(seed uint32) *Group {
-		switch *mode {
-		case "skin":
-			return BuildSkin(settings, seed, skinParams)
-		default:
-			return BuildScene(settings, seed)
-		}
-	}
-	root := build(currentSeed)
-
-	// Headless mode: write the STL and exit.
+	// Headless: build once at export resolution and write the STL.
 	if *stlOnly != "" {
-		if err := WriteBinarySTL(*stlOnly, root); err != nil {
+		seed, ok := control.ParseSeed(cfg.Seed)
+		if !ok {
+			seed = control.RandomSeed()
+		}
+		g := cfg.Build(seed, cfg.ExportResolution)
+		if err := engine.WriteBinarySTL(*stlOnly, g); err != nil {
 			log.Fatalf("stl: %v", err)
 		}
-		fmt.Printf("wrote %s (seed=%06x)\n", *stlOnly, currentSeed)
+		fmt.Printf("wrote %s (seed=%06x, res=%d)\n", *stlOnly, seed, cfg.ExportResolution)
 		return
 	}
 
-	if err := glfw.Init(); err != nil {
-		log.Fatalf("glfw init: %v", err)
+	app := control.NewApp(cfg, *configPath)
+	app.Start() // background build worker + first build
+
+	url := "http://" + *addr
+	fmt.Printf("friendlycube — open %s\n", url)
+	if *open {
+		go openBrowser(url)
 	}
-	defer glfw.Terminate()
-	glfw.WindowHint(glfw.ContextVersionMajor, 4)
-	glfw.WindowHint(glfw.ContextVersionMinor, 1)
-	glfw.WindowHint(glfw.OpenGLProfile, glfw.OpenGLCoreProfile)
-	glfw.WindowHint(glfw.OpenGLForwardCompatible, glfw.True)
-	glfw.WindowHint(glfw.Samples, 4)
-
-	win, err := glfw.CreateWindow(winW, winH, "Marble Handshake Lattice — Go/OpenGL", nil, nil)
-	if err != nil {
-		log.Fatalf("create window: %v", err)
-	}
-	win.MakeContextCurrent()
-	if err := gl.Init(); err != nil {
-		log.Fatalf("gl init: %v", err)
-	}
-	glfw.SwapInterval(1)
-	gl.Enable(gl.MULTISAMPLE)
-
-	bg := [3]float32{0x1a / 255.0, 0x1a / 255.0, 0x1c / 255.0}
-	r, err := NewRenderer(bg)
-	if err != nil {
-		log.Fatalf("renderer: %v", err)
-	}
-	r.Upload(root)
-
-	// Interaction state mirrors the JS: rotX clamped to ±1.3, rotY free.
-	rotX := float32(0.3)
-	rotY := float32(0.6)
-	spinning := *autoSpin
-	dragging := false
-	lastMX, lastMY := 0.0, 0.0
-	camPos := mgl32.Vec3{4.2, 2.8, 5.0}
-
-	regen := func() {
-		currentSeed = uint32(rand.Uint32() & 0xffffff)
-		root = build(currentSeed)
-		r.Upload(root)
-		fmt.Printf("regenerated, seed=%06x\n", currentSeed)
-	}
-
-	saveSTL := func() {
-		path := fmt.Sprintf("lattice-%06x.stl", currentSeed)
-		if err := WriteBinarySTL(path, root); err != nil {
-			fmt.Fprintf(os.Stderr, "stl save failed: %v\n", err)
-			return
-		}
-		fmt.Printf("wrote %s\n", path)
-	}
-
-	win.SetMouseButtonCallback(func(_ *glfw.Window, button glfw.MouseButton, action glfw.Action, _ glfw.ModifierKey) {
-		if button != glfw.MouseButtonLeft {
-			return
-		}
-		if action == glfw.Press {
-			dragging = true
-			lastMX, lastMY = win.GetCursorPos()
-		} else if action == glfw.Release {
-			dragging = false
-		}
-	})
-	win.SetCursorPosCallback(func(_ *glfw.Window, x, y float64) {
-		if !dragging {
-			return
-		}
-		rotY += float32(x-lastMX) * 0.008
-		rotX += float32(y-lastMY) * 0.008
-		if rotX > 1.3 {
-			rotX = 1.3
-		}
-		if rotX < -1.3 {
-			rotX = -1.3
-		}
-		lastMX, lastMY = x, y
-	})
-	win.SetKeyCallback(func(_ *glfw.Window, key glfw.Key, _ int, action glfw.Action, _ glfw.ModifierKey) {
-		if action != glfw.Press {
-			return
-		}
-		switch key {
-		case glfw.KeyEscape, glfw.KeyQ:
-			win.SetShouldClose(true)
-		case glfw.KeyR:
-			regen()
-		case glfw.KeyS:
-			saveSTL()
-		case glfw.KeySpace:
-			spinning = !spinning
-			if spinning {
-				fmt.Println("auto-rotate on")
-			} else {
-				fmt.Println("auto-rotate off")
-			}
-		}
-	})
-	win.SetFramebufferSizeCallback(func(_ *glfw.Window, w, h int) {
-		gl.Viewport(0, 0, int32(w), int32(h))
-	})
-
-	fmt.Println("controls: drag = rotate · space = pause · R = regen · S = save STL · ESC = quit")
-	fmt.Printf("seed=%06x\n", currentSeed)
-	lastTime := time.Now()
-	for !win.ShouldClose() {
-		now := time.Now()
-		dt := float32(now.Sub(lastTime).Seconds())
-		lastTime = now
-		if spinning && !dragging {
-			rotY += 0.4 * dt
-		}
-		fbw, fbh := win.GetFramebufferSize()
-		r.Draw(fbw, fbh, rotX, rotY, camPos)
-		win.SwapBuffers()
-		glfw.PollEvents()
+	if err := app.Serve(*addr); err != nil {
+		log.Fatalf("server: %v", err)
 	}
 }
 
-func parseHexSeed(s string) (uint32, error) {
-	var v uint64
-	if _, err := fmt.Sscanf(s, "%x", &v); err != nil {
-		// fall back to decimal
-		if _, err2 := fmt.Sscanf(s, "%d", &v); err2 != nil {
-			return 0, err
-		}
+// openBrowser best-effort launches the OS default browser. Errors are ignored;
+// the URL is always printed so the user can open it manually.
+func openBrowser(url string) {
+	var cmd string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = "open"
+	case "windows":
+		cmd, args = "rundll32", []string{"url.dll,FileProtocolHandler"}
+	default:
+		cmd = "xdg-open"
 	}
-	return uint32(v), nil
+	_ = exec.Command(cmd, append(args, url)...).Start()
 }
