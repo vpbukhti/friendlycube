@@ -28,7 +28,7 @@ type Config struct {
 	// ---- Structure (generation) ----
 	CubeSize         float64 `json:"cubeSize"`
 	StrutR           float64 `json:"strutR"`    // strut / edge tube radius (edge width)
-	ButtressR        float64 `json:"buttressR"` // support tube radius
+	ButtressR        float64 `json:"buttressR"` // thin secondary ("support") strut radius — part of the piece, not a print aid
 	Target           int     `json:"target"`    // number of struts to place
 	MinClearance     float64 `json:"minClearance"`
 	Mix              float64 `json:"mix"`           // fraction edge-to-edge vs free struts
@@ -48,7 +48,12 @@ type Config struct {
 	ApexSkipMult     float64 `json:"apexSkipMult"`
 	SupportMinLen    float64 `json:"supportMinLen"`
 
-	// ---- Sleeve / skin field ----
+	// ---- Skin ----
+	// These are the real inputs the engine builds from. In the panel two macro
+	// sliders ("skin thickness" → blendK+cap, "edge roundness" → clipBlend) and
+	// the corner slider drive them together, and the Advanced sections decouple
+	// individual values. gamma/sharpRatio and the corner clip guards are the
+	// finer knobs, exposed only under Advanced.
 	BlendK      float64 `json:"blendK"`      // crowding blend reach k (length)
 	Gamma       float64 `json:"gamma"`       // crowding exponent γ
 	Cap         float64 `json:"cap"`         // joint push-out cap B (<=0 = off)
@@ -98,15 +103,15 @@ func DefaultConfig() Config {
 		ApexSkipMult:     1.3,
 		SupportMinLen:    0.6,
 
-		BlendK:      0.05,
-		Gamma:       0.8,
-		Cap:         0.12,
-		SharpRatio:  0.2,
-		Corner:      0.62,
-		Fillet:      0,
-		VertexGuard: 0,  // auto (mode-aware)
-		ClipBlend:   -1, // auto (~0.4×r)
-		ClipVBlend:  -1, // auto (~r)
+		BlendK:      0.05,  // macro "skin thickness" 0.5
+		Gamma:       0.8,   // (advanced)
+		Cap:         0.12,  // macro "skin thickness" 0.5
+		SharpRatio:  0.2,   // (advanced)
+		Corner:      0.62,  // macro "corner cutoff"
+		Fillet:      0,     // (advanced) 0 = match strut
+		VertexGuard: 0,     // (advanced) auto (mode-aware)
+		ClipBlend:   0.034, // macro "edge roundness" 0.5  (= 0.4×r)
+		ClipVBlend:  -1,    // (advanced) auto (~r)
 
 		Resolution:       160,
 		ExportResolution: 240,
@@ -169,8 +174,8 @@ func (c Config) ToSettings() engine.Settings {
 	}
 }
 
-// ToSkinParams maps the sleeve + meshing knobs onto the engine's SkinParams.
-// res lets the caller substitute a resolution (e.g. ExportResolution).
+// ToSkinParams maps the (real) skin + meshing knobs onto the engine's
+// SkinParams 1:1. res substitutes a resolution (e.g. ExportResolution).
 func (c Config) ToSkinParams(res int) engine.SkinParams {
 	return engine.SkinParams{
 		Resolution:  res,

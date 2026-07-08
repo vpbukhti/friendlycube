@@ -45,6 +45,13 @@
     background:var(--panel);border:1px solid var(--accent2);border-radius:8px;
     padding:9px 14px;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.on{opacity:1}
+  .adv-tog{color:var(--mut);font-size:10.5px;cursor:pointer;user-select:none;
+    padding:1px 0 5px 122px}
+  .adv-tog:hover{color:var(--accent2)}
+  .adv-box{margin:0 0 8px 8px;padding-left:8px;border-left:1px solid var(--line)}
+  #tip{position:fixed;display:none;max-width:250px;background:#15151a;color:var(--txt);
+    border:1px solid var(--accent2);border-radius:7px;padding:7px 10px;font-size:11.5px;
+    line-height:1.4;z-index:50;pointer-events:none;box-shadow:0 5px 16px rgba(0,0,0,.45)}
 </style>
 </head>
 <body>
@@ -66,6 +73,7 @@
   </div>
   <div id="panel"></div>
 </div>
+<div id="tip"></div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -79,17 +87,58 @@ function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');clea
 let cfg={}, schema=[], spin=true;
 let postTimer=null;
 function schedulePost(){clearTimeout(postTimer);postTimer=setTimeout(()=>jpost('/api/config',cfg),350);}
+const controls={};                 // key -> fn(value) to set a control's display
+const clamp01=x=>x<0?0:x>1?1:x;
+function refresh(key){ if(controls[key]) controls[key](cfg[key]); }
 
-function makeRow(p){
+// Macro sliders (0..1) derive/inverse the underlying values. These formulas
+// mirror the Go reference (config.go); r = strut radius, 0.5 = tuned look.
+function masterGet(key){
+  const r=cfg.strutR||0.085;
+  if(key==='skinThickness'){ const rs=r/0.085;
+    return clamp01(0.5+Math.log(cfg.blendK/(0.05*rs))/(2*Math.log(2.5))); }
+  if(key==='edgeRoundness'){ const t=cfg.clipBlend/r;
+    return clamp01(t<=0.4 ? t/0.8 : 0.5+(t-0.4)/1.6); }
+  return 0.5;
+}
+function masterSet(key,v){
+  const r=cfg.strutR||0.085;
+  if(key==='skinThickness'){ const rs=r/0.085;
+    cfg.blendK=+(0.05*rs*Math.pow(2.5,2*v-1)).toFixed(5);
+    cfg.cap   =+(0.12*rs*Math.pow(2.8,2*v-1)).toFixed(5);
+    refresh('blendK'); refresh('cap'); }
+  else if(key==='edgeRoundness'){
+    cfg.clipBlend=+((v<=0.5 ? r*0.8*v : r*(0.4+1.6*(v-0.5)))).toFixed(5);
+    refresh('clipBlend'); }
+  schedulePost();
+}
+const childToMaster={blendK:'skinThickness',cap:'skinThickness',clipBlend:'edgeRoundness'};
+
+// hover help — custom tooltip, appears after a short delay near the cursor
+let tipMX=0,tipMY=0,tipTimer=null; const tip=$('#tip');
+function placeTip(){const pad=14,w=tip.offsetWidth,h=tip.offsetHeight;
+  let x=tipMX+pad,y=tipMY+pad;
+  if(x+w>innerWidth-8)x=tipMX-pad-w; if(y+h>innerHeight-8)y=tipMY-pad-h;
+  tip.style.left=Math.max(4,x)+'px'; tip.style.top=Math.max(4,y)+'px';}
+function attachHelp(el,text){ if(!text)return;
+  el.addEventListener('mouseenter',()=>{clearTimeout(tipTimer);
+    tipTimer=setTimeout(()=>{tip.textContent=text;tip.style.display='block';placeTip();},450);});
+  el.addEventListener('mousemove',e=>{tipMX=e.clientX;tipMY=e.clientY;if(tip.style.display==='block')placeTip();});
+  el.addEventListener('mouseleave',()=>{clearTimeout(tipTimer);tip.style.display='none';});
+}
+
+// one input control (slider+number / checkbox / select / text / master)
+function makeControl(p){
   const row=document.createElement('div'); row.className='row';
   const lab=document.createElement('label'); lab.textContent=p.label;
   if(p.note){const n=document.createElement('span');n.className='note';n.textContent=' '+p.note;lab.appendChild(n);}
-  row.appendChild(lab);
+  row.appendChild(lab); attachHelp(row,p.help);
   if(p.kind==='bool'){
     row.classList.add('wide');
     const cb=document.createElement('input');cb.type='checkbox';cb.checked=!!cfg[p.key];
     cb.onchange=()=>{cfg[p.key]=cb.checked;
       if(p.key==='autoSpin'){spin=cb.checked;jpost('/api/spin',{on:cb.checked});}else schedulePost();};
+    controls[p.key]=v=>{cb.checked=!!v;};
     row.appendChild(cb);return row;
   }
   if(p.kind==='enum'){
@@ -97,26 +146,49 @@ function makeRow(p){
     const sel=document.createElement('select');
     for(const o of p.enum){const opt=document.createElement('option');opt.value=o;opt.textContent=o;sel.appendChild(opt);}
     sel.value=cfg[p.key]; sel.onchange=()=>{cfg[p.key]=sel.value;schedulePost();};
+    controls[p.key]=v=>{sel.value=v;};
     row.appendChild(sel);return row;
   }
   if(p.kind==='text'){
     row.classList.add('wide');
     const inp=document.createElement('input');inp.type='text';inp.value=cfg[p.key]??'';inp.id='f_'+p.key;
     inp.onchange=()=>{cfg[p.key]=inp.value;schedulePost();};
+    controls[p.key]=v=>{inp.value=v??'';};
     row.appendChild(inp);return row;
   }
-  const isInt=p.kind==='int';
+  // numeric: float / int / master
+  const isMaster=p.kind==='master', isInt=p.kind==='int';
   const rng=document.createElement('input');rng.type='range';
-  rng.min=p.min;rng.max=p.max;rng.step=p.step||(isInt?1:0.01);rng.value=cfg[p.key];
+  rng.min=p.min;rng.max=p.max;rng.step=p.step||(isInt?1:0.01);
   const num=document.createElement('input');num.type='number';
-  num.min=p.min;num.max=p.max;num.step=rng.step;num.value=cfg[p.key];
+  num.min=p.min;num.max=p.max;num.step=rng.step;
+  const setDisplay=v=>{rng.value=v; num.value=(!isInt&&typeof v==='number')?+v.toFixed(4):v;};
+  setDisplay(isMaster?masterGet(p.key):cfg[p.key]);
   const commit=v=>{let n=isInt?parseInt(v,10):parseFloat(v);if(isNaN(n))return;
-    cfg[p.key]=n;rng.value=n;num.value=n;schedulePost();};
+    setDisplay(n);
+    if(isMaster){ masterSet(p.key,n); }
+    else { cfg[p.key]=n; schedulePost(); if(childToMaster[p.key]) refresh(childToMaster[p.key]); }
+  };
   rng.oninput=()=>commit(rng.value); num.onchange=()=>commit(num.value);
+  controls[p.key]=v=> setDisplay(isMaster?masterGet(p.key):v);
   row.appendChild(rng);row.appendChild(num);return row;
 }
+
+// a control plus, if it has underlying params, a collapsible Advanced section
+function makeRow(p){
+  const control=makeControl(p);
+  if(!p.advanced||!p.advanced.length) return control;
+  const wrap=document.createElement('div'); wrap.appendChild(control);
+  const tog=document.createElement('div'); tog.className='adv-tog'; tog.textContent='▸ Advanced';
+  const box=document.createElement('div'); box.className='adv-box'; box.style.display='none';
+  for(const c of p.advanced) box.appendChild(makeControl(c));
+  tog.onclick=()=>{const open=box.style.display==='none';
+    box.style.display=open?'block':'none'; tog.textContent=(open?'▾':'▸')+' Advanced';};
+  wrap.appendChild(tog); wrap.appendChild(box); return wrap;
+}
+
 function renderPanel(){
-  const panel=$('#panel');panel.innerHTML='';
+  const panel=$('#panel');panel.innerHTML=''; for(const k in controls) delete controls[k];
   for(const g of schema){
     const box=document.createElement('div');box.className='group';
     const h=document.createElement('h2');h.textContent=g.title;box.appendChild(h);

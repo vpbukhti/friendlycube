@@ -30,7 +30,7 @@
   "corner": 0.62,
   "fillet": 0,
   "vertexGuard": 0,
-  "clipBlend": -1,
+  "clipBlend": 0.034,
   "clipVBlend": -1,
   "resolution": 160,
   "exportResolution": 240,
