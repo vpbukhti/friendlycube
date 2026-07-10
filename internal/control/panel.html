@@ -3,11 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>friendlycube</title>
 <style>
   :root{
     --bg:#1a1a1c; --panel:#242427; --line:#34343a; --txt:#e8e4da; --mut:#9a968c;
-    --accent:#eae3d4; --accent2:#85b7eb;
+    --accent:#eae3d4; --accent2:#85b7eb; --warn:#e24b4a;
   }
   *{box-sizing:border-box}
   html,body{height:100%}
@@ -23,10 +24,13 @@
     border-radius:7px;padding:7px 11px;font:inherit;cursor:pointer}
   button:hover{border-color:var(--accent2)}
   button.primary{background:var(--accent);color:#1a1a1c;border-color:var(--accent);font-weight:600}
+  button.on{background:var(--accent2);color:#111;border-color:var(--accent2);font-weight:600}
+  button.warn{border-color:var(--warn);color:#f2b6b5}
   #stage{display:flex;height:calc(100% - 52px)}
   #view{flex:1;position:relative;min-width:0}
   #gl{width:100%;height:100%;display:block;cursor:grab}
   #gl:active{cursor:grabbing}
+  body.editing #gl{cursor:crosshair}
   #hint{position:absolute;left:12px;bottom:10px;color:var(--mut);font-size:11px;
     pointer-events:none;opacity:.7}
   #panel{width:344px;flex:none;border-left:1px solid var(--line);overflow-y:auto;
@@ -52,6 +56,19 @@
   #tip{position:fixed;display:none;max-width:250px;background:#15151a;color:var(--txt);
     border:1px solid var(--accent2);border-radius:7px;padding:7px 10px;font-size:11.5px;
     line-height:1.4;z-index:50;pointer-events:none;box-shadow:0 5px 16px rgba(0,0,0,.45)}
+  /* editor */
+  #editbar{display:none;border:1px solid var(--accent2);border-radius:9px;
+    padding:10px 11px;margin:4px 0 12px;background:#20242b}
+  body.editing #editbar{display:block}
+  body.editing #paramgroups{opacity:.5;pointer-events:none}
+  #editbar h2{margin:0 0 8px;color:var(--accent2)}
+  #editbar .er{display:flex;gap:7px;flex-wrap:wrap;align-items:center;margin:6px 0}
+  #editbar .er label{color:var(--mut);font-size:12px}
+  #editsel{margin-top:9px;padding-top:9px;border-top:1px solid var(--line);font-size:12px;min-height:18px}
+  #editsel .k{color:var(--mut)}
+  #editsel .val{color:var(--accent2)}
+  #editsel .warnflag{color:var(--warn)}
+  .mini{font-size:11px;color:var(--mut);margin-top:6px;line-height:1.5}
 </style>
 </head>
 <body>
@@ -61,6 +78,7 @@
   <span class="badge">tris <b id="tris">0</b></span>
   <span id="building" class="badge">● rendering…</span>
   <span class="sp"></span>
+  <button id="edit">Edit frame</button>
   <button id="regen">Regenerate</button>
   <button id="save">Save</button>
   <button id="load">Load</button>
@@ -71,7 +89,31 @@
     <canvas id="gl"></canvas>
     <div id="hint">drag to orbit · scroll to zoom</div>
   </div>
-  <div id="panel"></div>
+  <div id="panel">
+    <div id="editbar">
+      <h2>Frame editor</h2>
+      <div class="er">
+        <button id="undo" title="Undo (Ctrl/Cmd+Z)">↶ Undo</button>
+        <button id="previewSkin">Preview skin</button>
+        <button id="exitEdit">Exit</button>
+      </div>
+      <div class="er">
+        <label>Gizmo</label>
+        <button id="gizmoFrame" class="on">cube</button>
+        <label><input type="checkbox" id="showHS" checked> handshakes</label>
+      </div>
+      <div class="er">
+        <label>New strut</label>
+        <select id="newKind" style="flex:0 0 74px"><option value="thick">thick</option><option value="thin">thin</option></select>
+        <button id="addStrut">+ Add</button>
+      </div>
+      <div id="editsel">Nothing selected. Click a strut or a joint.</div>
+      <div class="mini">Click a strut → width / delete. Click a joint → drag (or arrow keys)
+        to move; drag a colored arrow to lock an axis. Click a strut then one of its ends
+        to move just that end.</div>
+    </div>
+    <div id="paramgroups"></div>
+  </div>
 </div>
 <div id="tip"></div>
 <div class="toast" id="toast"></div>
@@ -86,35 +128,70 @@ function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');clea
 /* ---------------- control panel ---------------- */
 let cfg={}, schema=[], spin=true;
 let postTimer=null;
-function schedulePost(){clearTimeout(postTimer);postTimer=setTimeout(()=>jpost('/api/config',cfg),350);}
+
+// Config is nested (mode/seed/autoSpin at root, then skin{} and frame{}); the
+// schema keys stay flat, so these map a flat key to its nested home.
+const KEY_GROUP={};
+['mode','seed','autoSpin'].forEach(k=>KEY_GROUP[k]='root');
+['blendK','gamma','cap','sharpRatio','corner','fillet','vertexGuard','clipBlend','clipVBlend',
+ 'resolution','exportResolution','padding','relax','lambda'].forEach(k=>KEY_GROUP[k]='skin');
+const FRAME_KEYS=['cubeSize','strutR','buttressR','target','minClearance','mix','handshakeProb',
+ 'neighborWeight','edgeBias','lf100','lf95','lf90','lf85','lf70'];
+FRAME_KEYS.forEach(k=>KEY_GROUP[k]='frame');
+const FRAME_SET=new Set(FRAME_KEYS);
+function cfgGet(k){const g=KEY_GROUP[k];
+  if(g==='skin')return (cfg.skin||{})[k]; if(g==='frame')return (cfg.frame||{})[k]; return cfg[k];}
+function cfgSet(k,v){const g=KEY_GROUP[k];
+  if(g==='skin'){cfg.skin=cfg.skin||{};cfg.skin[k]=v;}
+  else if(g==='frame'){cfg.frame=cfg.frame||{};cfg.frame[k]=v;}
+  else cfg[k]=v;}
+// A key is "structural" if changing it can alter the generated frame skeleton.
+function isStructural(k){return k==='seed'||FRAME_SET.has(k);}
+
+function schedulePost(structural){clearTimeout(postTimer);
+  postTimer=setTimeout(()=>postConfig(structural),350);}
+async function postConfig(structural){
+  let discard=false;
+  if(structural && appState.modified){
+    if(!confirm('Discard your hand-edited frame and regenerate it from the parameters?')){
+      await reloadConfig(); return;
+    }
+    discard=true;
+  }
+  const body=Object.assign({},cfg); if(discard) body.discardModified=true;
+  const r=await jpost('/api/config',body);
+  if(r && r.needConfirm){ await reloadConfig(); }
+  else if(discard){ appState.modified=false; if(appState.on) await loadSkeleton(); }
+}
+async function reloadConfig(){ cfg=await jget('/api/config'); spin=!!cfg.autoSpin; renderPanel(); }
+
 const controls={};                 // key -> fn(value) to set a control's display
 const clamp01=x=>x<0?0:x>1?1:x;
-function refresh(key){ if(controls[key]) controls[key](cfg[key]); }
+function refresh(key){ if(controls[key]) controls[key](cfgGet(key)); }
 
-// Macro sliders (0..1) derive/inverse the underlying values. These formulas
-// mirror the Go reference (config.go); r = strut radius, 0.5 = tuned look.
+// Macro sliders (0..1) derive/inverse the underlying values.
 function masterGet(key){
-  const r=cfg.strutR||0.085;
+  const r=cfgGet('strutR')||0.085;
   if(key==='skinThickness'){ const rs=r/0.085;
-    return clamp01(0.5+Math.log(cfg.blendK/(0.05*rs))/(2*Math.log(2.5))); }
-  if(key==='edgeRoundness'){ const t=cfg.clipBlend/r;
+    return clamp01(0.5+Math.log(cfgGet('blendK')/(0.05*rs))/(2*Math.log(2.5))); }
+  if(key==='edgeRoundness'){ const t=cfgGet('clipBlend')/r;
     return clamp01(t<=0.4 ? t/0.8 : 0.5+(t-0.4)/1.6); }
   return 0.5;
 }
 function masterSet(key,v){
-  const r=cfg.strutR||0.085;
+  const r=cfgGet('strutR')||0.085;
   if(key==='skinThickness'){ const rs=r/0.085;
-    cfg.blendK=+(0.05*rs*Math.pow(2.5,2*v-1)).toFixed(5);
-    cfg.cap   =+(0.12*rs*Math.pow(2.8,2*v-1)).toFixed(5);
+    cfgSet('blendK',+(0.05*rs*Math.pow(2.5,2*v-1)).toFixed(5));
+    cfgSet('cap',+(0.12*rs*Math.pow(2.8,2*v-1)).toFixed(5));
     refresh('blendK'); refresh('cap'); }
   else if(key==='edgeRoundness'){
-    cfg.clipBlend=+((v<=0.5 ? r*0.8*v : r*(0.4+1.6*(v-0.5)))).toFixed(5);
+    cfgSet('clipBlend',+((v<=0.5 ? r*0.8*v : r*(0.4+1.6*(v-0.5)))).toFixed(5));
     refresh('clipBlend'); }
-  schedulePost();
+  schedulePost(false);
 }
 const childToMaster={blendK:'skinThickness',cap:'skinThickness',clipBlend:'edgeRoundness'};
 
-// hover help — custom tooltip, appears after a short delay near the cursor
+// hover help — custom tooltip
 let tipMX=0,tipMY=0,tipTimer=null; const tip=$('#tip');
 function placeTip(){const pad=14,w=tip.offsetWidth,h=tip.offsetHeight;
   let x=tipMX+pad,y=tipMY+pad;
@@ -127,17 +204,17 @@ function attachHelp(el,text){ if(!text)return;
   el.addEventListener('mouseleave',()=>{clearTimeout(tipTimer);tip.style.display='none';});
 }
 
-// one input control (slider+number / checkbox / select / text / master)
 function makeControl(p){
   const row=document.createElement('div'); row.className='row';
   const lab=document.createElement('label'); lab.textContent=p.label;
   if(p.note){const n=document.createElement('span');n.className='note';n.textContent=' '+p.note;lab.appendChild(n);}
   row.appendChild(lab); attachHelp(row,p.help);
+  const structural=isStructural(p.key);
   if(p.kind==='bool'){
     row.classList.add('wide');
-    const cb=document.createElement('input');cb.type='checkbox';cb.checked=!!cfg[p.key];
-    cb.onchange=()=>{cfg[p.key]=cb.checked;
-      if(p.key==='autoSpin'){spin=cb.checked;jpost('/api/spin',{on:cb.checked});}else schedulePost();};
+    const cb=document.createElement('input');cb.type='checkbox';cb.checked=!!cfgGet(p.key);
+    cb.onchange=()=>{cfgSet(p.key,cb.checked);
+      if(p.key==='autoSpin'){spin=cb.checked;jpost('/api/spin',{on:cb.checked});}else schedulePost(structural);};
     controls[p.key]=v=>{cb.checked=!!v;};
     row.appendChild(cb);return row;
   }
@@ -145,36 +222,34 @@ function makeControl(p){
     row.classList.add('wide');
     const sel=document.createElement('select');
     for(const o of p.enum){const opt=document.createElement('option');opt.value=o;opt.textContent=o;sel.appendChild(opt);}
-    sel.value=cfg[p.key]; sel.onchange=()=>{cfg[p.key]=sel.value;schedulePost();};
+    sel.value=cfgGet(p.key); sel.onchange=()=>{cfgSet(p.key,sel.value);schedulePost(structural);};
     controls[p.key]=v=>{sel.value=v;};
     row.appendChild(sel);return row;
   }
   if(p.kind==='text'){
     row.classList.add('wide');
-    const inp=document.createElement('input');inp.type='text';inp.value=cfg[p.key]??'';inp.id='f_'+p.key;
-    inp.onchange=()=>{cfg[p.key]=inp.value;schedulePost();};
+    const inp=document.createElement('input');inp.type='text';inp.value=cfgGet(p.key)??'';inp.id='f_'+p.key;
+    inp.onchange=()=>{cfgSet(p.key,inp.value);schedulePost(structural);};
     controls[p.key]=v=>{inp.value=v??'';};
     row.appendChild(inp);return row;
   }
-  // numeric: float / int / master
   const isMaster=p.kind==='master', isInt=p.kind==='int';
   const rng=document.createElement('input');rng.type='range';
   rng.min=p.min;rng.max=p.max;rng.step=p.step||(isInt?1:0.01);
   const num=document.createElement('input');num.type='number';
   num.min=p.min;num.max=p.max;num.step=rng.step;
   const setDisplay=v=>{rng.value=v; num.value=(!isInt&&typeof v==='number')?+v.toFixed(4):v;};
-  setDisplay(isMaster?masterGet(p.key):cfg[p.key]);
+  setDisplay(isMaster?masterGet(p.key):cfgGet(p.key));
   const commit=v=>{let n=isInt?parseInt(v,10):parseFloat(v);if(isNaN(n))return;
     setDisplay(n);
     if(isMaster){ masterSet(p.key,n); }
-    else { cfg[p.key]=n; schedulePost(); if(childToMaster[p.key]) refresh(childToMaster[p.key]); }
+    else { cfgSet(p.key,n); schedulePost(structural); if(childToMaster[p.key]) refresh(childToMaster[p.key]); }
   };
   rng.oninput=()=>commit(rng.value); num.onchange=()=>commit(num.value);
   controls[p.key]=v=> setDisplay(isMaster?masterGet(p.key):v);
   row.appendChild(rng);row.appendChild(num);return row;
 }
 
-// a control plus, if it has underlying params, a collapsible Advanced section
 function makeRow(p){
   const control=makeControl(p);
   if(!p.advanced||!p.advanced.length) return control;
@@ -188,23 +263,32 @@ function makeRow(p){
 }
 
 function renderPanel(){
-  const panel=$('#panel');panel.innerHTML=''; for(const k in controls) delete controls[k];
+  const panel=$('#paramgroups');panel.innerHTML=''; for(const k in controls) delete controls[k];
   for(const g of schema){
     const box=document.createElement('div');box.className='group';
     const h=document.createElement('h2');h.textContent=g.title;box.appendChild(h);
     for(const p of g.params)box.appendChild(makeRow(p));
     panel.appendChild(box);
   }
+  applyEditLock();
+}
+// While editing the frame, the parameter panel is locked: structural params
+// can't be changed until you exit (they would otherwise clobber your edits).
+function applyEditLock(){
+  document.querySelectorAll('#paramgroups input, #paramgroups select')
+    .forEach(el=>{el.disabled=appState.on;});
 }
 $('#regen').onclick=async()=>{const r=await jpost('/api/regen');cfg.seed=r.seed;
-  const f=$('#f_seed');if(f)f.value=r.seed;toast('regenerated · '+r.seed);};
-$('#export').onclick=async()=>{toast('exporting @ '+cfg.exportResolution+'…');
-  const r=await jpost('/api/export',{resolution:cfg.exportResolution});
+  const f=$('#f_seed');if(f)f.value=r.seed; appState.modified=false; if(appState.on) await loadSkeleton();
+  toast('regenerated · '+r.seed);};
+$('#export').onclick=async()=>{toast('exporting @ '+cfgGet('exportResolution')+'…');
+  const r=await jpost('/api/export',{resolution:cfgGet('exportResolution')});
   toast(r.path?('exported '+r.path):'export failed');};
 $('#save').onclick=async()=>{const p=prompt('Save config to:','config.json');if(p===null)return;
   const r=await jpost('/api/save',{path:p});toast('saved '+r.path);};
 $('#load').onclick=async()=>{const p=prompt('Load config from:','config.json');if(p===null)return;
-  const r=await jpost('/api/load',{path:p});if(r&&!r.error){cfg=r;spin=!!cfg.autoSpin;renderPanel();toast('loaded '+p);}else toast('load failed');};
+  const r=await jpost('/api/load',{path:p});if(r&&!r.error){cfg=r;spin=!!cfg.autoSpin;renderPanel();
+    if(appState.on) await loadSkeleton(); toast('loaded '+p);}else toast('load failed');};
 
 /* ---------------- WebGL view ---------------- */
 const canvas=$('#gl');
@@ -234,11 +318,18 @@ void main(){
   }
   gl_FragColor=vec4(pow(lit,vec3(1.0/1.6)),1.0);
 }`;
+// Flat-color program for the editor overlay (lines + points, no lighting).
+const VERT2=`attribute vec3 aPos; uniform mat4 uMVP; uniform float uPS;
+void main(){ gl_Position=uMVP*vec4(aPos,1.0); gl_PointSize=uPS; }`;
+const FRAG2=`precision mediump float; uniform vec3 uColor;
+void main(){ gl_FragColor=vec4(uColor,1.0); }`;
 function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.compileShader(s);
   if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(s);return s;}
-const prog=gl.createProgram();
-gl.attachShader(prog,sh(gl.VERTEX_SHADER,VERT));gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FRAG));
-gl.linkProgram(prog);gl.useProgram(prog);
+function makeProg(v,f){const p=gl.createProgram();
+  gl.attachShader(p,sh(gl.VERTEX_SHADER,v));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,f));
+  gl.linkProgram(p);return p;}
+const prog=makeProg(VERT,FRAG);
+gl.useProgram(prog);
 const loc={
   aPos:gl.getAttribLocation(prog,'aPos'), aNormal:gl.getAttribLocation(prog,'aNormal'), aColor:gl.getAttribLocation(prog,'aColor'),
   uMVP:gl.getUniformLocation(prog,'uMVP'), uModel:gl.getUniformLocation(prog,'uModel'),
@@ -246,33 +337,22 @@ const loc={
   uLightDirs:gl.getUniformLocation(prog,'uLightDirs'), uLightCols:gl.getUniformLocation(prog,'uLightCols'),
   uAmbient:gl.getUniformLocation(prog,'uAmbient'),
 };
+const prog2=makeProg(VERT2,FRAG2);
+const loc2={aPos:gl.getAttribLocation(prog2,'aPos'),uMVP:gl.getUniformLocation(prog2,'uMVP'),
+  uPS:gl.getUniformLocation(prog2,'uPS'),uColor:gl.getUniformLocation(prog2,'uColor')};
 const posBuf=gl.createBuffer(),nrmBuf=gl.createBuffer(),colBuf=gl.createBuffer();
+const ovBuf=gl.createBuffer();
 let vertexCount=0, loadedVersion=-1;
 gl.enable(gl.DEPTH_TEST);
 const bg=[0x1a/255,0x1a/255,0x1c/255];
 const lightDirs=new Float32Array([-5,-8,-4, 4,-2,3, 0,4,5]);
 const lightCols=new Float32Array([0.9,0.864,0.792, 0.316,0.34,0.3645, 0.3,0.273,0.231]);
 
-// interaction — trackball: orientation is an accumulated rotation matrix, and
-// drags compose incremental rotations about the camera's screen axes. No Euler
-// angles → no gimbal lock and no rotation limits (free tumbling any direction).
-// Inertia: while dragging it chases the pointer quickly (low inertia); on
-// release it keeps the flung momentum and coasts to a stop (higher inertia).
-let orient=null;                    // rotation mat4, set in init once helpers exist
-let velYaw=0, velPitch=0;           // angular velocity (rad/s) about screen up / right
-let pendYaw=0, pendPitch=0;         // pointer motion not yet consumed by a frame
+// interaction — trackball
+let orient=null;
+let velYaw=0, velPitch=0, pendYaw=0, pendPitch=0;
 let zoom=1, dragging=false, lastX=0, lastY=0;
-const GAIN=0.008;          // mouse pixels → radians
-const DRAG_FOLLOW=22;      // how fast rotation chases the pointer while dragging (higher = less inertia)
-const RELEASE_FRICTION=1.8;// how fast the throw decays after release (lower = more inertia / longer coast)
-const MAX_VEL=7;           // clamp fling speed (rad/s)
-canvas.addEventListener('mousedown',e=>{dragging=true;lastX=e.clientX;lastY=e.clientY;velYaw=0;velPitch=0;pendYaw=0;pendPitch=0;});
-window.addEventListener('mouseup',()=>dragging=false);
-window.addEventListener('mousemove',e=>{if(!dragging)return;
-  pendYaw+=(e.clientX-lastX)*GAIN; pendPitch+=(e.clientY-lastY)*GAIN;
-  lastX=e.clientX; lastY=e.clientY;});
-canvas.addEventListener('wheel',e=>{e.preventDefault();
-  zoom*=Math.exp(e.deltaY*0.0011); zoom=Math.max(0.35,Math.min(4,zoom));},{passive:false});
+const GAIN=0.008, DRAG_FOLLOW=22, RELEASE_FRICTION=1.8, MAX_VEL=7;
 
 // matrices (column-major)
 function m4mul(a,b){const o=new Float32Array(16);
@@ -280,6 +360,8 @@ function m4mul(a,b){const o=new Float32Array(16);
 function m4persp(f,asp,n,fa){const t=1/Math.tan(f/2),nf=1/(n-fa);
   return new Float32Array([t/asp,0,0,0, 0,t,0,0, 0,0,(fa+n)*nf,-1, 0,0,2*fa*n*nf,0]);}
 const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]];
+const add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]];
+const scale=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
 const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
 const dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
 const norm=a=>{const l=Math.hypot(a[0],a[1],a[2])||1;return[a[0]/l,a[1]/l,a[2]/l];};
@@ -287,26 +369,77 @@ function m4lookAt(e,c,u){const z=norm(sub(e,c)),x=norm(cross(u,z)),y=cross(z,x);
   return new Float32Array([x[0],y[0],z[0],0, x[1],y[1],z[1],0, x[2],y[2],z[2],0, -dot(x,e),-dot(y,e),-dot(z,e),1]);}
 function m4rotX(a){const c=Math.cos(a),s=Math.sin(a);return new Float32Array([1,0,0,0,0,c,s,0,0,-s,c,0,0,0,0,1]);}
 function m4rotY(a){const c=Math.cos(a),s=Math.sin(a);return new Float32Array([c,0,-s,0,0,1,0,0,s,0,c,0,0,0,0,1]);}
-// Rotation about an arbitrary unit axis (Rodrigues), column-major.
 function m4axis(ax,ang){const x=ax[0],y=ax[1],z=ax[2],c=Math.cos(ang),s=Math.sin(ang),t=1-c;
   return new Float32Array([
     t*x*x+c,   t*x*y+s*z, t*x*z-s*y, 0,
     t*x*y-s*z, t*y*y+c,   t*y*z+s*x, 0,
     t*x*z+s*y, t*y*z-s*x, t*z*z+c,   0,
     0,0,0,1]);}
+// 4x4 inverse (column-major) for unprojection.
+function m4inv(m){
+  const a=m; const inv=new Float32Array(16);
+  inv[0]=a[5]*a[10]*a[15]-a[5]*a[11]*a[14]-a[9]*a[6]*a[15]+a[9]*a[7]*a[14]+a[13]*a[6]*a[11]-a[13]*a[7]*a[10];
+  inv[4]=-a[4]*a[10]*a[15]+a[4]*a[11]*a[14]+a[8]*a[6]*a[15]-a[8]*a[7]*a[14]-a[12]*a[6]*a[11]+a[12]*a[7]*a[10];
+  inv[8]=a[4]*a[9]*a[15]-a[4]*a[11]*a[13]-a[8]*a[5]*a[15]+a[8]*a[7]*a[13]+a[12]*a[5]*a[11]-a[12]*a[7]*a[9];
+  inv[12]=-a[4]*a[9]*a[14]+a[4]*a[10]*a[13]+a[8]*a[5]*a[14]-a[8]*a[6]*a[13]-a[12]*a[5]*a[10]+a[12]*a[6]*a[9];
+  inv[1]=-a[1]*a[10]*a[15]+a[1]*a[11]*a[14]+a[9]*a[2]*a[15]-a[9]*a[3]*a[14]-a[13]*a[2]*a[11]+a[13]*a[3]*a[10];
+  inv[5]=a[0]*a[10]*a[15]-a[0]*a[11]*a[14]-a[8]*a[2]*a[15]+a[8]*a[3]*a[14]+a[12]*a[2]*a[11]-a[12]*a[3]*a[10];
+  inv[9]=-a[0]*a[9]*a[15]+a[0]*a[11]*a[13]+a[8]*a[1]*a[15]-a[8]*a[3]*a[13]-a[12]*a[1]*a[11]+a[12]*a[3]*a[9];
+  inv[13]=a[0]*a[9]*a[14]-a[0]*a[10]*a[13]-a[8]*a[1]*a[14]+a[8]*a[2]*a[13]+a[12]*a[1]*a[10]-a[12]*a[2]*a[9];
+  inv[2]=a[1]*a[6]*a[15]-a[1]*a[7]*a[14]-a[5]*a[2]*a[15]+a[5]*a[3]*a[14]+a[13]*a[2]*a[7]-a[13]*a[3]*a[6];
+  inv[6]=-a[0]*a[6]*a[15]+a[0]*a[7]*a[14]+a[4]*a[2]*a[15]-a[4]*a[3]*a[14]-a[12]*a[2]*a[7]+a[12]*a[3]*a[6];
+  inv[10]=a[0]*a[5]*a[15]-a[0]*a[7]*a[13]-a[4]*a[1]*a[15]+a[4]*a[3]*a[13]+a[12]*a[1]*a[7]-a[12]*a[3]*a[5];
+  inv[14]=-a[0]*a[5]*a[14]+a[0]*a[6]*a[13]+a[4]*a[1]*a[14]-a[4]*a[2]*a[13]-a[12]*a[1]*a[6]+a[12]*a[2]*a[5];
+  inv[3]=-a[1]*a[6]*a[11]+a[1]*a[7]*a[10]+a[5]*a[2]*a[11]-a[5]*a[3]*a[10]-a[9]*a[2]*a[7]+a[9]*a[3]*a[6];
+  inv[7]=a[0]*a[6]*a[11]-a[0]*a[7]*a[10]-a[4]*a[2]*a[11]+a[4]*a[3]*a[10]+a[8]*a[2]*a[7]-a[8]*a[3]*a[6];
+  inv[11]=-a[0]*a[5]*a[11]+a[0]*a[7]*a[9]+a[4]*a[1]*a[11]-a[4]*a[3]*a[9]-a[8]*a[1]*a[7]+a[8]*a[3]*a[5];
+  inv[15]=a[0]*a[5]*a[10]-a[0]*a[6]*a[9]-a[4]*a[1]*a[10]+a[4]*a[2]*a[9]+a[8]*a[1]*a[6]-a[8]*a[2]*a[5];
+  let det=a[0]*inv[0]+a[1]*inv[4]+a[2]*inv[8]+a[3]*inv[12];
+  if(Math.abs(det)<1e-12)return null; det=1/det;
+  for(let i=0;i<16;i++)inv[i]*=det; return inv;
+}
 const camBase=[4.2,2.8,5.0];
-// Camera screen axes in world space (constant — zoom only slides along camDir).
 const camDir=norm(camBase);
 const camRight=norm(cross([0,1,0],camDir));
 const camUp=cross(camDir,camRight);
-// Apply a yaw (about screen up) then pitch (about screen right) to the
-// orientation, in world space (pre-multiply). Small per-frame angles.
 function tumble(yaw,pitch){
   orient=m4mul(m4axis(camUp,yaw),orient);
   orient=m4mul(m4axis(camRight,pitch),orient);
 }
-// initial pose ≈ the old default view
 orient=m4mul(m4rotX(0.3),m4rotY(0.6));
+
+// Live view state (updated each frame; used for picking / unprojection).
+let curMVP=null, curInv=null, curCW=1, curCH=1;
+function worldToCSS(p){ // returns {x,y,w} in CSS px (y down), w = clip.w
+  const m=curMVP, x=p[0],y=p[1],z=p[2];
+  const cx=m[0]*x+m[4]*y+m[8]*z+m[12];
+  const cy=m[1]*x+m[5]*y+m[9]*z+m[13];
+  const cw=m[3]*x+m[7]*y+m[11]*z+m[15];
+  return {x:(cx/cw*0.5+0.5)*curCW, y:(1-(cy/cw*0.5+0.5))*curCH, w:cw};
+}
+function unprojectRay(mx,my){
+  if(!curInv)return null;
+  const ndx=mx/curCW*2-1, ndy=1-my/curCH*2;
+  const un=(z)=>{const v=[ndx,ndy,z,1],o=[0,0,0,0];
+    for(let r=0;r<4;r++)o[r]=curInv[0+r]*v[0]+curInv[4+r]*v[1]+curInv[8+r]*v[2]+curInv[12+r]*v[3];
+    return [o[0]/o[3],o[1]/o[3],o[2]/o[3]];};
+  const nr=un(-1), fr=un(1);
+  return {o:nr, d:norm(sub(fr,nr))};
+}
+function rayPlane(ray,p0,n){const dn=dot(ray.d,n); if(Math.abs(dn)<1e-9)return p0.slice();
+  const t=dot(sub(p0,ray.o),n)/dn; return add(ray.o,scale(ray.d,t));}
+// rayAxisParam: parameter t along the line (p0 + t·axis) of its closest point
+// to the ray. Used for relative axis-dragging (delta from grab), which avoids
+// the vertex snapping to wherever the ray first hits the axis.
+function rayAxisParam(ray,p0,axis){
+  const u=ray.d,v=axis,w0=sub(ray.o,p0);
+  const a=dot(u,u),b=dot(u,v),c=dot(v,v),d=dot(u,w0),e=dot(v,w0);
+  const den=a*c-b*b; if(Math.abs(den)<1e-9)return 0;
+  return (a*e-b*d)/den;}
+// closest point on segment [a,b] to the ray, clamped to the segment (used to
+// read off a 3D spot on a strut/edge under the cursor when placing a new strut).
+function raySegClosest(ray,a,b){const ax=sub(b,a);
+  const t=Math.max(0,Math.min(1,rayAxisParam(ray,a,ax))); return add(a,scale(ax,t));}
 
 async function loadMesh(){
   const resp=await fetch('/api/mesh'); const buf=await resp.arrayBuffer();
@@ -331,10 +464,8 @@ function resize(){
 let last=performance.now();
 function frame(now){
   const dt=Math.min((now-last)/1000,0.05); last=now;
+  const editingActive=appState.on;
   if(dragging){
-    // Consume a fraction of the pending pointer motion (eased → a little
-    // weight), carry the rest, and read velocity off what we applied so a
-    // release can fling it.
     const a=1-Math.exp(-DRAG_FOLLOW*dt);
     const ay=pendYaw*a, ap=pendPitch*a;
     tumble(ay,ap);
@@ -343,21 +474,22 @@ function frame(now){
     velYaw=Math.max(-MAX_VEL,Math.min(MAX_VEL,velYaw));
     velPitch=Math.max(-MAX_VEL,Math.min(MAX_VEL,velPitch));
   }else{
-    const baseYaw=spin?0.4*dt:0;            // baseline idle spin about screen up
-    tumble(velYaw*dt+baseYaw, velPitch*dt); // coasting momentum on top
+    const baseYaw=(spin&&!editingActive)?0.4*dt:0;
+    tumble(velYaw*dt+baseYaw, velPitch*dt);
     const decay=Math.exp(-RELEASE_FRICTION*dt);
     velYaw*=decay; velPitch*=decay;
   }
   resize();
   gl.viewport(0,0,canvas.width,canvas.height);
   gl.clearColor(bg[0],bg[1],bg[2],1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  const asp=canvas.width/Math.max(1,canvas.height);
+  const proj=m4persp(38*Math.PI/180,asp,0.1,100);
+  const eye=[camBase[0]*zoom,camBase[1]*zoom,camBase[2]*zoom];
+  const view=m4lookAt(eye,[0,0,0],[0,1,0]);
+  const model=orient;
+  const mvp=m4mul(proj,m4mul(view,model));
+  curMVP=mvp; curInv=m4inv(mvp); curCW=canvas.clientWidth; curCH=canvas.clientHeight;
   if(vertexCount>0){
-    const asp=canvas.width/Math.max(1,canvas.height);
-    const proj=m4persp(38*Math.PI/180,asp,0.1,100);
-    const eye=[camBase[0]*zoom,camBase[1]*zoom,camBase[2]*zoom];
-    const view=m4lookAt(eye,[0,0,0],[0,1,0]);
-    const model=orient;
-    const mvp=m4mul(proj,m4mul(view,model));
     const nm=new Float32Array([model[0],model[1],model[2],model[4],model[5],model[6],model[8],model[9],model[10]]);
     gl.useProgram(prog);
     gl.uniformMatrix4fv(loc.uMVP,false,mvp);
@@ -370,8 +502,429 @@ function frame(now){
     bindAttr(loc.aPos,posBuf); bindAttr(loc.aNormal,nrmBuf); bindAttr(loc.aColor,colBuf);
     gl.drawArrays(gl.TRIANGLES,0,vertexCount);
   }
+  if(editingActive && appState.skel) drawOverlay(mvp);
   requestAnimationFrame(frame);
 }
+
+/* ---------------- editor ---------------- */
+const appState={on:false, skel:null, sel:null, hover:null, drag:null,
+  gizmoFrame:'cube', modified:false, editMode:false, skelVersion:-1};
+
+function overlayDraw(positions,color,mode,ps){
+  if(!positions.length)return;
+  gl.useProgram(prog2);
+  gl.uniformMatrix4fv(loc2.uMVP,false,curMVP);
+  gl.uniform3fv(loc2.uColor,new Float32Array(color));
+  gl.uniform1f(loc2.uPS,ps||1);
+  gl.bindBuffer(gl.ARRAY_BUFFER,ovBuf);
+  gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(positions),gl.DYNAMIC_DRAW);
+  gl.enableVertexAttribArray(loc2.aPos);
+  gl.vertexAttribPointer(loc2.aPos,3,gl.FLOAT,false,0,0);
+  gl.drawArrays(mode,0,positions.length/3);
+}
+// resolved endpoints (from the live mirror's shared vertex table)
+function stA(st){return st.aVert>=0?appState.skel.vertices[st.aVert]:st.a;}
+function stB(st){return st.bVert>=0?appState.skel.vertices[st.bVert]:st.b;}
+function stP1(ss){return ss.p1Vert>=0?appState.skel.vertices[ss.p1Vert]:ss.p1;}
+function stP2(ss){return ss.p2Vert>=0?appState.skel.vertices[ss.p2Vert]:ss.p2;}
+
+function drawOverlay(mvp){
+  gl.disable(gl.DEPTH_TEST);
+  const sk=appState.skel;
+  const C={base:[0.62,0.7,0.82], thin:[0.45,0.68,0.6], hover:[0.98,0.85,0.4],
+    sel:[0.3,0.95,0.85], red:[0.89,0.29,0.29], vert:[0.16,0.55,0.98]};
+  const hov=appState.hover, sel=appState.sel;
+  const isHov=(t,id)=>hov&&hov.type===t&&hov.id===id;
+  const isSel=(t,id)=>sel&&sel.type===t&&sel.id===id;
+  // struts
+  for(const st of sk.struts){
+    const a=stA(st),b=stB(st);
+    let col=st.kind==='thin'?C.thin:C.base;
+    if(isHov('strut',st.id))col=C.hover;
+    if(isSel('strut',st.id))col=C.sel;
+    overlayDraw([a[0],a[1],a[2],b[0],b[1],b[2]],col,gl.LINES);
+  }
+  // support web (thin struts) — selectable; dim otherwise
+  const supDim=[];
+  for(const ss of (sk.supports||[])){
+    const a=stP1(ss),b=stP2(ss); const p=[a[0],a[1],a[2],b[0],b[1],b[2]];
+    if(isSel('support',ss.id))overlayDraw(p,C.sel,gl.LINES);
+    else if(isHov('support',ss.id))overlayDraw(p,C.hover,gl.LINES);
+    else supDim.push(...p);
+  }
+  overlayDraw(supDim,[0.34,0.46,0.42],gl.LINES);
+  // vertices (shared interior joints)
+  const vp=[],vh=[],vs=[];
+  sk.vertices.forEach((v,i)=>{
+    if(isSel('vertex',i))vs.push(v[0],v[1],v[2]);
+    else if(isHov('vertex',i))vh.push(v[0],v[1],v[2]);
+    else vp.push(v[0],v[1],v[2]);
+  });
+  overlayDraw(vp,C.vert,gl.POINTS,13);
+  overlayDraw(vh,C.hover,gl.POINTS,18);
+  overlayDraw(vs,C.sel,gl.POINTS,20);
+  // selected strut/support endpoints (grab handles for detaching an end)
+  if(sel&&sel.type==='strut'){
+    const st=strutById(sel.id); if(st){const a=stA(st),b=stB(st);
+      overlayDraw([a[0],a[1],a[2],b[0],b[1],b[2]],[0.98,0.7,0.35],gl.POINTS,13);}
+  }
+  if(sel&&sel.type==='support'){
+    const ss=supportById(sel.id); if(ss){const a=stP1(ss),b=stP2(ss);
+      overlayDraw([a[0],a[1],a[2],b[0],b[1],b[2]],[0.98,0.7,0.35],gl.POINTS,13);}
+  }
+  if(sel&&(sel.type==='endpoint'||sel.type==='supEndpoint')){
+    const p=endpointPos(sel); if(p)overlayDraw([p[0],p[1],p[2]],C.sel,gl.POINTS,16);
+  }
+  // undesirable handshake markers
+  const hp=[];
+  for(const h of (sk.handshakes||[])) if(h.undesirable) hp.push(h.mid[0],h.mid[1],h.mid[2]);
+  overlayDraw(hp,C.red,gl.POINTS,13);
+  // gizmo
+  const gc=selectedMovePos();
+  if(gc){
+    const axes=gizmoAxes(); const L=(sk.cubeSize||2)*0.28;
+    const cols=[[0.95,0.35,0.35],[0.4,0.9,0.45],[0.45,0.6,0.98]];
+    axes.forEach((ax,i)=>{const tip=add(gc,scale(ax,L));
+      let col=cols[i];
+      if((appState.drag&&appState.drag.axis===i)||(hov&&hov.type==='arrow'&&hov.axis===i))col=[0.98,0.85,0.4];
+      overlayDraw([gc[0],gc[1],gc[2],tip[0],tip[1],tip[2]],col,gl.LINES);
+      overlayDraw([tip[0],tip[1],tip[2]],col,gl.POINTS,11);
+    });
+  }
+  // new-strut placement preview: the fixed first end, a rubber-band to the
+  // snapped candidate under the cursor, and the candidate dot.
+  if(appState.place){
+    const a=appState.place.a, pv=appState.place.preview;
+    if(a&&pv) overlayDraw([a[0],a[1],a[2],pv.pos[0],pv.pos[1],pv.pos[2]],[0.98,0.85,0.4],gl.LINES);
+    if(a) overlayDraw([a[0],a[1],a[2]],C.sel,gl.POINTS,15);
+    if(pv) overlayDraw([pv.pos[0],pv.pos[1],pv.pos[2]],[0.98,0.85,0.4],gl.POINTS,15);
+  }
+  gl.enable(gl.DEPTH_TEST);
+}
+function gizmoAxes(){
+  if(appState.gizmoFrame==='cube') return [[1,0,0],[0,1,0],[0,0,1]];
+  // camera frame: screen right/up/forward mapped back into skeleton space (orient^T · v)
+  const m=orient; const tr=v=>[m[0]*v[0]+m[1]*v[1]+m[2]*v[2], m[4]*v[0]+m[5]*v[1]+m[6]*v[2], m[8]*v[0]+m[9]*v[1]+m[10]*v[2]];
+  return [norm(tr(camRight)),norm(tr(camUp)),norm(tr(camDir))];
+}
+function strutById(id){return appState.skel.struts.find(s=>s.id===id);}
+function supportById(id){return (appState.skel.supports||[]).find(s=>s.id===id);}
+function selIsStrut(id){return appState.sel&&appState.sel.type==='strut'&&appState.sel.id===id;}
+function selIsVertex(i){return appState.sel&&appState.sel.type==='vertex'&&appState.sel.id===i;}
+function endpointPos(sel){
+  if(sel.type==='supEndpoint'){const ss=supportById(sel.id); if(!ss)return null; return sel.which==='p2'?stP2(ss):stP1(ss);}
+  const st=strutById(sel.id); if(!st)return null; return sel.which==='b'?stB(st):stA(st);
+}
+function selectedMovePos(){
+  const sel=appState.sel; if(!sel)return null;
+  if(sel.type==='vertex')return appState.skel.vertices[sel.id];
+  if(sel.type==='endpoint'||sel.type==='supEndpoint')return endpointPos(sel);
+  return null;
+}
+
+// ---- picking (generous CSS-pixel radii; vertices beat struts beat supports) ----
+function pickAt(mx,my){
+  const sk=appState.skel; if(!sk)return null;
+  // gizmo arrows first (only when something movable is selected)
+  const gc=selectedMovePos();
+  if(gc){const axes=gizmoAxes(),L=(sk.cubeSize||2)*0.28;
+    let best=null,bestD=14;
+    axes.forEach((ax,i)=>{const tip=add(gc,scale(ax,L));
+      const d=segDistCSS(mx,my,gc,tip); if(d<bestD){bestD=d;best={type:'arrow',axis:i};}});
+    if(best)return best;
+  }
+  // endpoint handles of a selected strut (priority + a touch larger than the
+  // plain-vertex radius, so the selected strut's own end always wins → detach)
+  if(appState.sel&&appState.sel.type==='strut'){const st=strutById(appState.sel.id);
+    if(st){for(const which of ['a','b']){const p=which==='b'?stB(st):stA(st);
+      const s=worldToCSS(p); if(s.w>0&&Math.hypot(s.x-mx,s.y-my)<16)return {type:'endpoint',id:st.id,which};}}}
+  // endpoint handles of a selected support (detach just this support's end)
+  if(appState.sel&&appState.sel.type==='support'){const ss=supportById(appState.sel.id);
+    if(ss){for(const which of ['p1','p2']){const p=which==='p2'?stP2(ss):stP1(ss);
+      const s=worldToCSS(p); if(s.w>0&&Math.hypot(s.x-mx,s.y-my)<16)return {type:'supEndpoint',id:ss.id,which};}}}
+  // shared vertices — radius matched to the ~13px dot so you hit the dot you aim
+  // at (a bigger radius grabbed dense neighbours / stole clicks off the lines).
+  let best=null,bestD=13;
+  sk.vertices.forEach((v,i)=>{const s=worldToCSS(v); if(s.w<=0)return;
+    const d=Math.hypot(s.x-mx,s.y-my); if(d<bestD){bestD=d;best={type:'vertex',id:i};}});
+  if(best)return best;
+  // thick struts
+  bestD=13; best=null;
+  for(const st of sk.struts){const d=segDistCSS(mx,my,stA(st),stB(st)); if(d<bestD){bestD=d;best={type:'strut',id:st.id};}}
+  if(best)return best;
+  // thin support struts (a bit more forgiving so the thin line is easy to grab)
+  bestD=13; best=null;
+  for(const ss of (sk.supports||[])){const d=segDistCSS(mx,my,stP1(ss),stP2(ss)); if(d<bestD){bestD=d;best={type:'support',id:ss.id};}}
+  return best;
+}
+function segDistCSS(mx,my,a,b){
+  const A=worldToCSS(a),B=worldToCSS(b); if(A.w<=0||B.w<=0)return 1e9;
+  const vx=B.x-A.x,vy=B.y-A.y, wx=mx-A.x,wy=my-A.y;
+  const l2=vx*vx+vy*vy; let t=l2>0?(wx*vx+wy*vy)/l2:0; t=Math.max(0,Math.min(1,t));
+  return Math.hypot(A.x+vx*t-mx, A.y+vy*t-my);
+}
+function mouseCSS(e){const r=canvas.getBoundingClientRect(); return [e.clientX-r.left, e.clientY-r.top];}
+
+// pickSpot finds a 3D point on an existing feature under the cursor, for placing
+// a new strut's end. Joints/corners win; then cube edges + thick strut bodies
+// (a thin strut may only attach to those, per the rules — thin supports are not
+// offered). Returns {pos,on} or null when the cursor isn't over anything valid.
+function pickSpot(mx,my,thin){
+  const sk=appState.skel; if(!sk)return null;
+  const half=(sk.cubeSize||2)/2, ray=unprojectRay(mx,my); if(!ray)return null;
+  let best=null,bestD=18;
+  for(const c of cubeCorners(half)){const s=worldToCSS(c); if(s.w<=0)continue;
+    const d=Math.hypot(s.x-mx,s.y-my); if(d<bestD){bestD=d;best={pos:c,on:'corner'};}}
+  sk.vertices.forEach(v=>{const s=worldToCSS(v); if(s.w<=0)return;
+    const d=Math.hypot(s.x-mx,s.y-my); if(d<bestD){bestD=d;best={pos:v,on:'joint'};}});
+  if(best)return best;
+  bestD=14; best=null;
+  for(const e of cubeEdges(half)){const d=segDistCSS(mx,my,e[0],e[1]); if(d<bestD){bestD=d;best={pos:raySegClosest(ray,e[0],e[1]),on:'edge'};}}
+  for(const st of sk.struts){ if(thin&&st.kind==='thin')continue;
+    const d=segDistCSS(mx,my,stA(st),stB(st)); if(d<bestD){bestD=d;best={pos:raySegClosest(ray,stA(st),stB(st)),on:'strut'};}}
+  return best;
+}
+
+// ---- client snapping (mirrors the server's SnapEditPoint, so the live drag
+// preview matches what gets committed) ----
+function cubeCorners(half){const c=[];for(const x of[-half,half])for(const y of[-half,half])for(const z of[-half,half])c.push([x,y,z]);return c;}
+function cubeEdges(half){const V=cubeCorners(half),e=[];
+  for(let i=0;i<V.length;i++)for(let j=i+1;j<V.length;j++){let diff=0;
+    for(let k=0;k<3;k++)if(V[i][k]!==V[j][k])diff++; if(diff===1)e.push([V[i],V[j]]);}
+  return e;}
+function closestOnSegJS(a,b,p){const ab=sub(b,a),l2=dot(ab,ab);
+  let t=l2>1e-18?dot(sub(p,a),ab)/l2:0; t=Math.max(0,Math.min(1,t)); return add(a,scale(ab,t));}
+const d3=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1],a[2]-b[2]);
+function snapEdit(p,exVert,exStrut,thin){
+  const sk=appState.skel, half=(sk.cubeSize||2)/2, r=sk.strutR||0.085;
+  let q=[Math.max(-half,Math.min(half,p[0])),Math.max(-half,Math.min(half,p[1])),Math.max(-half,Math.min(half,p[2]))];
+  // strong: cube corners + other shared joints
+  const rVert=(2.5/1.5)*r; let best=null,bestD=rVert;
+  for(const c of cubeCorners(half)){const d=d3(q,c); if(d<bestD){bestD=d;best=c;}}
+  if(!thin) sk.vertices.forEach((v,i)=>{if(i===exVert)return; const d=d3(q,v); if(d<bestD){bestD=d;best=v;}});
+  if(best)return best.slice();
+  // weaker: cube edges + thick strut bodies (slide onto them)
+  const rEdge=(1.8/1.5)*r; best=null; bestD=rEdge;
+  for(const e of cubeEdges(half)){const pr=closestOnSegJS(e[0],e[1],q),d=d3(q,pr); if(d<bestD){bestD=d;best=pr;}}
+  for(const st of sk.struts){ if(st.id===exStrut||st.kind==='thin')continue;
+    if(st.aVert===exVert||st.bVert===exVert)continue;
+    const pr=closestOnSegJS(stA(st),stB(st),q),d=d3(q,pr); if(d<bestD){bestD=d;best=pr;}}
+  return best?best.slice():q;
+}
+function dragExcludes(){const sel=appState.sel;
+  if(sel.type==='vertex')return {exV:sel.id,exStrut:-1,thin:false};
+  if(sel.type==='endpoint'){const st=strutById(sel.id);const v=st?(sel.which==='b'?st.bVert:st.aVert):-1;return {exV:v,exStrut:sel.id,thin:false};}
+  if(sel.type==='supEndpoint'){const ss=supportById(sel.id);const v=ss?(sel.which==='p2'?ss.p2Vert:ss.p1Vert):-1;return {exV:v,exStrut:-1,thin:false};}
+  return {exV:-1,exStrut:-1,thin:false};}
+
+// ---- interaction ----
+// A joint/endpoint mousedown selects AND arms a drag, but only commits if the
+// pointer actually moves (past a small threshold) — so a plain click just
+// selects. Gizmo arrows arm a constrained drag; struts/supports select on a
+// clean click; empty space orbits.
+canvas.addEventListener('mousedown',e=>{
+  const [mx,my]=mouseCSS(e);
+  if(appState.place){ // placing a new strut: click places, drag orbits
+    dragging=true;lastX=e.clientX;lastY=e.clientY;appState._moved=false; return;
+  }
+  if(appState.on){
+    const hit=pickAt(mx,my);
+    if(hit&&hit.type==='arrow'){ beginDrag(hit.axis,mx,my); return; }
+    if(hit&&(hit.type==='vertex'||hit.type==='endpoint'||hit.type==='supEndpoint')){ selectHit(hit); beginDrag(-1,mx,my); return; }
+    if(hit&&(hit.type==='strut'||hit.type==='support')){ appState._pendPick=hit; appState._clearOnUp=false; }
+    else { appState._pendPick=null; appState._clearOnUp=true; }
+  }
+  dragging=true;lastX=e.clientX;lastY=e.clientY;velYaw=0;velPitch=0;pendYaw=0;pendPitch=0;
+  appState._moved=false;
+});
+window.addEventListener('mouseup',()=>{
+  if(appState.place){ if(!appState._moved) placeStep(); dragging=false; return; }
+  if(appState.drag){ if(appState.drag.moved) commitDrag(); appState.drag=null; dragging=false; return; }
+  if(appState.on && !appState._moved){
+    if(appState._pendPick){ selectHit(appState._pendPick); }
+    else if(appState._clearOnUp){ appState.sel=null; renderSel(); }
+  }
+  appState._pendPick=null; appState._clearOnUp=false;
+  dragging=false;
+});
+window.addEventListener('mousemove',e=>{
+  const [mx,my]=mouseCSS(e); appState._mouse=[mx,my];
+  if(appState.drag){ dragMove(mx,my); return; }
+  if(dragging){
+    if(Math.abs(e.clientX-lastX)+Math.abs(e.clientY-lastY)>2)appState._moved=true;
+    pendYaw+=(e.clientX-lastX)*GAIN; pendPitch+=(e.clientY-lastY)*GAIN;
+    lastX=e.clientX; lastY=e.clientY; return;
+  }
+  if(appState.place){ appState.place.preview=pickSpot(mx,my,appState.place.kind==='thin'); return; }
+  if(appState.on){ appState.hover=pickAt(mx,my); }
+});
+canvas.addEventListener('wheel',e=>{e.preventDefault();
+  zoom*=Math.exp(e.deltaY*0.0011); zoom=Math.max(0.35,Math.min(4,zoom));},{passive:false});
+
+// beginDrag arms a drag from the grab point. axis>=0 locks to that gizmo axis
+// (relative to the grab, so no jump); axis<0 is a free drag in the view plane.
+function beginDrag(axis,mx,my){
+  const p0=selectedMovePos(); if(!p0)return;
+  const ray=unprojectRay(mx,my);
+  const d={axis, p0:p0.slice(), sx:mx, sy:my, moved:false};
+  if(axis>=0){ d.axisVec=gizmoAxes()[axis]; d.t0=ray?rayAxisParam(ray,p0,d.axisVec):0; }
+  else { d.planeN=ray?ray.d:[0,0,1]; const grab=ray?rayPlane(ray,p0,d.planeN):p0; d.offset=sub(p0,grab); }
+  appState.drag=d;
+}
+function dragMove(mx,my){
+  const d=appState.drag, ray=unprojectRay(mx,my); if(!ray)return;
+  if(!d.moved && Math.hypot(mx-d.sx,my-d.sy)<3) return; // ignore click jitter
+  d.moved=true;
+  let np;
+  if(d.axis>=0){ const t=rayAxisParam(ray,d.p0,d.axisVec); np=add(d.p0,scale(d.axisVec,t-d.t0)); }
+  else { np=add(rayPlane(ray,d.p0,d.planeN),d.offset); }
+  const ex=dragExcludes(); np=snapEdit(np,ex.exV,ex.exStrut,ex.thin);
+  applyLocalMove(np);
+  const now=performance.now();               // throttled live commit so the
+  if(now-(appState._lastLive||0)>110){        // solid debug view follows the drag
+    appState._lastLive=now; sendEditLive();
+  }
+}
+function applyLocalMove(np){ // update the live mirror so the overlay follows the drag
+  const sk=appState.skel, sel=appState.sel;
+  if(sel.type==='vertex'){ sk.vertices[sel.id]=np;
+    for(const st of sk.struts){ if(st.aVert===sel.id)st.a=np; if(st.bVert===sel.id)st.b=np; }
+    for(const ss of sk.supports){ if(ss.p1Vert===sel.id)ss.p1=np; if(ss.p2Vert===sel.id)ss.p2=np; }
+  } else if(sel.type==='endpoint'){ const st=strutById(sel.id); if(st){ if(sel.which==='b')st.b=np; else st.a=np; } }
+  else if(sel.type==='supEndpoint'){ const ss=supportById(sel.id); if(ss){ if(sel.which==='p2')ss.p2=np; else ss.p1=np; } }
+}
+function editBody(){
+  const sel=appState.sel, sk=appState.skel; if(!sel)return null;
+  if(sel.type==='vertex')return {op:'moveVertex',vertexID:sel.id,to:sk.vertices[sel.id]};
+  if(sel.type==='endpoint'){const st=strutById(sel.id); if(!st)return null;
+    return {op:'moveEndpoint',strutID:sel.id,which:sel.which,to:sel.which==='b'?st.b:st.a};}
+  if(sel.type==='supEndpoint'){const ss=supportById(sel.id); if(!ss)return null;
+    return {op:'moveSupportEndpoint',supportID:sel.id,which:sel.which,to:sel.which==='p2'?ss.p2:ss.p1};}
+  return null;
+}
+// All edits go through one serial chain so the final commit is always applied
+// last (a late live-send can't land after it and make the joint jump back).
+// Live sends don't ingest — the server's snapped copy would fight the in-
+// progress drag; the authoritative result is ingested by the final commit.
+let _editChain=Promise.resolve();
+function enqueueEdit(body,ingest){
+  _editChain=_editChain.then(()=>jpost('/api/edit',body)).then(r=>{if(ingest)ingestSkeleton(r);}).catch(()=>{});
+  return _editChain;
+}
+function sendEditLive(){const b=editBody(); if(b){b.live=true; enqueueEdit(b,false);}}
+async function commitDrag(){const b=editBody(); if(b){b.live=false; await enqueueEdit(b,true);}}
+async function sendEdit(body){ await enqueueEdit(body,true); }
+
+// ---- add-strut placement ----
+function startPlacing(kind){ appState.place={kind:kind==='thin'?'thin':'thick', a:null, preview:null};
+  appState.sel=null; appState.hover=null; renderSel(); updateHint(); $('#addStrut').classList.add('on'); }
+function cancelPlacing(){ if(appState.place){ appState.place=null; $('#addStrut').classList.remove('on'); updateHint(); } }
+async function placeStep(){
+  const m=appState._mouse; if(!m||!appState.place)return;
+  const spot=pickSpot(m[0],m[1],appState.place.kind==='thin');
+  if(!spot){ toast('point at a strut, edge, or joint'); return; }
+  if(!appState.place.a){ appState.place.a=spot.pos.slice(); updateHint(); return; }
+  const a=appState.place.a, b=spot.pos.slice(), kind=appState.place.kind;
+  if(d3(a,b) < (appState.skel.cubeSize||2)*0.05){ toast('too short — pick a farther spot'); return; }
+  appState.place=null; $('#addStrut').classList.remove('on'); updateHint();
+  await sendEdit({op:'addStrut',a,b,kind});
+  toast('added '+kind+' strut');
+}
+function updateHint(){ const h=$('#hint');
+  if(appState.place){ h.textContent=(appState.place.a?'click the SECOND end':'click the FIRST end')+' on a strut, edge, or joint · Esc to cancel'; }
+  else if(appState.on){ h.textContent='drag empty space to orbit · click elements to edit'; }
+  else h.textContent='drag to orbit · scroll to zoom'; }
+
+function selectHit(hit){
+  if(hit.type==='vertex') appState.sel={type:'vertex',id:hit.id};
+  else if(hit.type==='endpoint') appState.sel={type:'endpoint',id:hit.id,which:hit.which};
+  else if(hit.type==='supEndpoint') appState.sel={type:'supEndpoint',id:hit.id,which:hit.which};
+  else if(hit.type==='strut') appState.sel={type:'strut',id:hit.id};
+  else if(hit.type==='support') appState.sel={type:'support',id:hit.id};
+  renderSel();
+}
+
+// arrow-key nudge along the gizmo axes (movable selections only)
+window.addEventListener('keydown',e=>{
+  if(!appState.on||!appState.sel||appState.sel.type==='strut'||appState.sel.type==='support')return;
+  const map={ArrowRight:[0,1],ArrowLeft:[0,-1],ArrowUp:[1,1],ArrowDown:[1,-1],PageUp:[2,1],PageDown:[2,-1]};
+  const m=map[e.key]; if(!m)return; e.preventDefault();
+  const sk=appState.skel, step=(sk.cubeSize||2)*0.01*m[1];
+  const ax=gizmoAxes()[m[0]]; const p0=selectedMovePos(); if(!p0)return;
+  const ex=dragExcludes();
+  const np=snapEdit(add(p0,scale(ax,step)),ex.exV,ex.exStrut,ex.thin);
+  applyLocalMove(np); commitDrag();
+});
+
+function renderSel(){
+  const el=$('#editsel'); const sel=appState.sel, sk=appState.skel;
+  if(!sel){el.innerHTML='Nothing selected. Click a strut, a thin support, or a joint.';return;}
+  if(sel.type==='strut'){
+    const st=strutById(sel.id); if(!st){el.textContent='';return;}
+    const w=st.width>0?st.width:(st.kind==='thin'?sk.buttressR:sk.strutR);
+    el.innerHTML=`<div><span class="k">strut</span> #${st.id} · <span class="val">${st.kind}</span></div>`;
+    const row=document.createElement('div');row.className='er';row.style.marginTop='7px';
+    const lab=document.createElement('label');lab.textContent='width';
+    const rng=document.createElement('input');rng.type='range';rng.min=0.01;rng.max=0.25;rng.step=0.005;rng.value=w;rng.style.flex='1';
+    const num=document.createElement('span');num.className='val';num.textContent=(+w).toFixed(3);
+    rng.oninput=()=>{num.textContent=(+rng.value).toFixed(3);};
+    rng.onchange=()=>sendEdit({op:'setWidth',strutID:st.id,width:+rng.value});
+    const del=document.createElement('button');del.className='warn';del.textContent='Delete';
+    del.onclick=()=>{sendEdit({op:'deleteStrut',strutID:st.id});appState.sel=null;renderSel();};
+    row.appendChild(lab);row.appendChild(rng);row.appendChild(num);
+    el.appendChild(row); el.appendChild(del);
+  } else if(sel.type==='support'){
+    el.innerHTML=`<div><span class="k">thin support</span> #${sel.id}</div>
+      <div class="mini">Click an end handle to move just that end, or delete it.</div>`;
+    const del=document.createElement('button');del.className='warn';del.textContent='Delete';del.style.marginTop='7px';
+    del.onclick=()=>{sendEdit({op:'deleteSupport',supportID:sel.id});appState.sel=null;renderSel();};
+    el.appendChild(del);
+  } else {
+    const p=selectedMovePos();
+    let kind='joint #'+sel.id;
+    if(sel.type==='endpoint') kind=`end ${sel.which.toUpperCase()} of strut #${sel.id}`;
+    else if(sel.type==='supEndpoint') kind=`end ${sel.which.toUpperCase()} of support #${sel.id}`;
+    el.innerHTML=`<div><span class="k">${kind}</span></div>`+
+      (p?`<div class="mini">(${p.map(x=>x.toFixed(2)).join(', ')}) — drag, arrow keys, or grab a colored axis</div>`:'');
+  }
+}
+
+function ingestSkeleton(r){
+  if(!r||!r.struts)return;
+  appState.skel=r; appState.modified=!!r.modified;
+  if(typeof r.skelVersion==='number')appState.skelVersion=r.skelVersion;
+  $('#showHS').checked=appState.showHandshakes!==false;
+  renderSel();
+}
+async function loadSkeleton(){ const r=await jget('/api/skeleton'); ingestSkeleton(r); }
+
+// ---- edit mode toggle + controls ----
+async function setEditMode(on){
+  appState.on=on;
+  if(!on) cancelPlacing();
+  document.body.classList.toggle('editing',on);
+  $('#edit').classList.toggle('on',on);
+  $('#edit').textContent=on?'Editing…':'Edit frame';
+  applyEditLock();
+  updateHint();
+  await jpost('/api/edit-mode',{on});
+  if(on){ await loadSkeleton(); } else { appState.sel=null; appState.hover=null; }
+}
+$('#edit').onclick=()=>setEditMode(!appState.on);
+$('#exitEdit').onclick=()=>setEditMode(false);
+async function doUndo(){ appState.sel=null; const r=await jpost('/api/undo'); ingestSkeleton(r); }
+$('#undo').onclick=doUndo;
+window.addEventListener('keydown',e=>{
+  if(!appState.on)return;
+  if((e.ctrlKey||e.metaKey)&&(e.key==='z'||e.key==='Z')&&!e.shiftKey){ e.preventDefault(); doUndo(); }
+  else if(e.key==='Escape'){ cancelPlacing(); }
+});
+$('#addStrut').onclick=()=>{ if(appState.place) cancelPlacing(); else startPlacing($('#newKind').value); };
+$('#previewSkin').onclick=async()=>{await jpost('/api/preview-skin');toast('previewing skin…');};
+$('#gizmoFrame').onclick=()=>{appState.gizmoFrame=appState.gizmoFrame==='cube'?'camera':'cube';
+  $('#gizmoFrame').textContent=appState.gizmoFrame;};
+$('#showHS').onchange=e=>{appState.showHandshakes=e.target.checked;
+  jpost('/api/edit',{op:'toggleHandshake',show:e.target.checked});};
 
 async function poll(){
   try{
@@ -379,8 +932,14 @@ async function poll(){
     $('#seed').textContent=s.seed||'—';
     $('#tris').textContent=(s.tris||0).toLocaleString();
     $('#building').classList.toggle('on',!!s.building);
+    appState.modified=!!s.modified;
+    if(typeof s.showHandshakes==='boolean')appState.showHandshakes=s.showHandshakes;
     if(s.seed && cfg.seed!==s.seed){cfg.seed=s.seed;const f=$('#f_seed');if(f)f.value=s.seed;}
     if(typeof s.version==='number' && s.version!==loadedVersion && !s.building){ await loadMesh(); }
+    // refetch skeleton if it changed under us (e.g. discard/regen) while editing
+    if(appState.on && typeof s.skelVersion==='number' && s.skelVersion!==appState.skelVersion && !appState.drag){
+      await loadSkeleton();
+    }
   }catch(e){}
   setTimeout(poll,500);
 }

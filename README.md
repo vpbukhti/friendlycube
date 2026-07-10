@@ -61,12 +61,44 @@ details of every parameter are in [PIPELINE.md](PIPELINE.md#parameters).
 Buttons: **Regenerate** (new random seed), **Save** / **Load** config, **Export
 STL**.
 
+## Frame editor
+
+**Edit frame** switches the panel into an editor and the view into the colored
+debug diagram, where you shape the strut skeleton by hand:
+
+- **Click a strut** → edit its **width**, or **delete** it.
+- **Click a joint** (an interior meeting point of struts) → move it. Dragging the
+  joint moves *every* strut that shares it; **arrow keys** nudge it in small
+  steps; dragging one of the colored **gizmo arrows** locks motion to that axis.
+  The gizmo axes follow either the **cube** or the **camera** frame (toggle).
+- **Click a strut, then one of its ends** → move just that one end, detaching it
+  from any shared joint.
+- Moving snaps to nearby joints, cube corners and cube edges (joints win over
+  edges), can't leave the cube, and won't drop two joints on top of each other.
+- **handshakes** are drawn as a separate overlay on top of the (watertight) body,
+  and turn **red** when a strut is too short for one or another strut crowds it.
+  Toggle their visibility; **Preview skin** re-meshes the finished look at any
+  time. **Exit** leaves the editor.
+
+The cube's 12 edges and 8 corners are the fixed frame — they're never editable.
+Once you hand-edit, the explicit skeleton becomes the source of truth; changing a
+structural parameter (or Regenerate) asks before discarding your edits.
+
 ## Configuration
 
-All parameters live in one JSON config. On start the program loads
-`config.default.json` (override with `-config path.json`); any key that is
-**absent or `null`** falls back to the baked-in default, so a config file only
-needs to list what it changes.
+All parameters live in one JSON config, split into two halves: **`skin`** (the
+implicit-sleeve + meshing/view knobs) and **`frame`** (the procedural generation
+params *and* the baked skeleton). Top-level `mode` / `seed` / `autoSpin` sit
+outside both. On start the program loads `config.default.json` (override with
+`-config path.json`); any key that is **absent or `null`** falls back to the
+baked-in default, so a config file only needs to list what it changes. Older
+flat configs (all keys at the top level) are migrated automatically on load.
+
+The `frame` holds a `generatedSkeleton` — the explicit struts/supports/handshakes
+baked from `(params, seed)`, cached on first build — and, once you use the
+**Frame editor**, a `modifiedSkeleton` that takes over as the source of truth.
+**Save** writes the whole thing (both halves plus the skeleton) so hand-edits
+survive a reload.
 
 - `config.default.json` at the repo root holds every default value.
 - **Save** in the panel writes the current settings to a file; **Load** reads one
@@ -99,8 +131,9 @@ Skip the window entirely and write an STL:
 main.go                  flags, config load, headless export, server start
 internal/engine/         the geometry + generation engine (physics)
   topology · struts · joints · supports · scene · skin   generation
+  bake · skeleton                                        editable frame (bake + edit ops)
   sdf · mesh · mc · relax · stl · math                   implicit field + meshing
-internal/control/        the "control center": Config, web panel, mesh server
+internal/control/        the "control center": Config, web panel + frame editor, mesh server
 config.default.json      all baked-in defaults
 PIPELINE.md              pipeline, math, and parameter reference
 organic_sleeve_method.md the original write-up of the implicit-sleeve method

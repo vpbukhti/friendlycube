@@ -42,11 +42,12 @@ func main() {
 		if !ok {
 			seed = control.RandomSeed()
 		}
-		g := cfg.Build(seed, cfg.ExportResolution)
+		cfg.EnsureGeneratedSkeleton(seed)
+		g := cfg.Build(seed, cfg.Skin.ExportResolution)
 		if err := engine.WriteBinarySTL(*stlOnly, g); err != nil {
 			log.Fatalf("stl: %v", err)
 		}
-		fmt.Printf("wrote %s (seed=%06x, res=%d)\n", *stlOnly, seed, cfg.ExportResolution)
+		fmt.Printf("wrote %s (seed=%06x, res=%d)\n", *stlOnly, seed, cfg.Skin.ExportResolution)
 		return
 	}
 

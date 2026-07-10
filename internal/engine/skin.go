@@ -83,71 +83,44 @@ func cornerMorphFromSlider(t float64, half, r float64) *CornerMorph {
 	return cm
 }
 
-// BuildSkin runs the same generation pipeline as BuildScene, but emits SDF
-// primitives for the structural skeleton (wireframe, strut bodies, joints,
-// supports) instead of direct meshes. The handshake hands/arms/palms still
-// render as their existing triangle meshes (per user direction — they're a
-// placeholder until being replaced in Blender). Output: one Group containing
-// the marching-cubes skin and the concatenated handshake mesh.
+// BuildSkin bakes the skeleton for one seed and meshes its implicit skin.
 func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
+	return BuildSkinFromSkeleton(s, BakeSkeleton(s, seed), sp)
+}
+
+// BuildSkinFromSkeleton wraps an explicit skeleton in one signed-distance field
+// and extracts its watertight skin. Every strut is a FULL-length capsule (thick
+// or thin) — the skin is complete everywhere; handshakes are a separate overlay
+// (BuildHandshakeOverlay), never a gap in the body. Supports come straight from
+// the skeleton. The field/clip/corner-morph/marching-cubes/relax stages are
+// unchanged from the original pipeline.
+func BuildSkinFromSkeleton(s Settings, sk *Skeleton, sp SkinParams) *Group {
 	half := s.CubeSize / 2
 	topo := BuildCubeTopology(half)
 
 	var prims []Primitive
 	var wire []Primitive
-	handshakeRoot := NewGroup()
 
-	// Wireframe: 12 edge capsules at strut radius. These go in their own list
-	// (hard-min'd, then corner-morphed) so the three caps meeting at each
-	// vertex form an exact radius-R sphere with no smooth-min bulge.
+	// Wireframe: 12 fixed edge capsules at strut radius. Hard-min'd + corner-
+	// morphed so the three caps at each vertex form one exact sphere.
 	for _, e := range topo.Edges {
 		wire = append(wire, Capsule{A: e.A, B: e.B, Radius: s.StrutR})
 	}
 
-	struts := GenerateStruts(&topo, s, seed)
-	dec := NewRand(seed ^ 0x9e3779b9)
-	var anchors []Anchor
-
-	for _, st := range struts {
-		hs := dec.F() < s.HandshakeProb
-		skinStrut(s, &topo, st, hs, dec, &prims, handshakeRoot, &anchors)
+	// Struts: one full watertight capsule each, at the strut's effective radius.
+	for _, st := range sk.Struts {
+		prims = append(prims, Capsule{A: sk.EndA(st), B: sk.EndB(st), Radius: st.EffRadius(s)})
 	}
-	for i := range anchors {
-		anchors[i].AnchorIdx = i
+	// Support web: thin capsules.
+	for _, ss := range sk.Supports {
+		prims = append(prims, Capsule{A: sk.EndP1(ss), B: sk.EndP2(ss), Radius: s.ButtressR})
 	}
 
-	anchorsByFace := map[int][]Anchor{}
-	for _, a := range anchors {
-		if a.Kind != "skin" {
-			continue
-		}
-		anchorsByFace[a.Face.Idx] = append(anchorsByFace[a.Face.Idx], a)
-	}
-	supports := planWebbingSupports(s, &topo, anchorsByFace, dec, struts)
-	for _, a := range anchors {
-		if a.Kind != "floating" {
-			continue
-		}
-		ps := planPyramidSupports(s, &topo, a.Anchor3D, a.PadR, a.AnchorIdx, dec, struts, []int{a.OwnerStrutID})
-		supports = append(supports, ps...)
-	}
-	supports = globalSupportVsSupportPass(s, supports)
-	for _, ss := range supports {
-		prims = append(prims, Capsule{A: ss.P1, B: ss.P2, Radius: s.ButtressR})
-	}
-
-	// Tube radius. The corner morph reuses this as both the corner-solid
-	// radius and the plane-cut tangent depth so corners meet the tubes
-	// seamlessly. sp.Fillet <= 0 means "match the strut girth".
+	// Tube radius for the corner morph (matches strut girth by default).
 	r := sp.Fillet
 	if r <= 0 {
 		r = s.StrutR
 	}
-	// No outer envelope: the wireframe is just the 12 capsules, so away from
-	// the vertices only one capsule term is ever active and the tubes stay
-	// exact cylinders of radius r. All corner shaping is confined to the 8
-	// vertices via CornerMorph, driven by the Corner slider ∈ [0, 1]:
-	//   0.0 → sharpest miter   0.5 → round (baseline)   1.0 → flattest cut.
 	cm := cornerMorphFromSlider(sp.Corner, half, r)
 	field := &Field{
 		Prims:   prims,
@@ -158,37 +131,21 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 		Cap:     sp.Cap,
 		KSharp:  sp.SharpRatio * sp.BlendK,
 	}
-	// Outer edge clip: the cube's imagined outer skin is a rounded cube whose
-	// edges coincide with the 12 wireframe edge tubes (a quarter-cylinder of
-	// radius r around each cube edge line) and whose faces sit at half+r. Cutting
-	// by it stops the sleeve bulging past the edges.
-	//
-	// Vertex guard: the clip must run right up to the corners so the edge stays
-	// radius r all the way to the vertex — otherwise the near-corner edge, left
-	// un-clipped, comes out fatter than the (clip-eased) rest of the edge. So we
-	// only guard the corner where the CornerMorph actually protrudes PAST the
-	// outer skin and would be clipped away:
-	//   - flat cut (Corner > 0.5): removes material → sits inside the skin → 0
-	//   - round (Corner = 0.5): sphere of radius r = the skin's corner → 0
-	//   - sharp miter (Corner < 0.5): the only case that pokes out, along the
-	//     body diagonal to tip = r·√1.5 / 3^(1/Power) (≈1.22·r at full miter,
-	//     shrinking to r as Power drops toward round) → guard exactly that tip.
-	// (The previous 1.6·r + Cap ball guarded a huge region at every vertex,
-	// which is what made the near-corner edge visibly wider.)
+	// Outer edge clip (see original notes in git history): a rounded cube whose
+	// edges coincide with the 12 wireframe tubes, guarded at the corners where
+	// the sharp miter pokes past the outer skin.
 	vguard := sp.VertexGuard
 	if vguard <= 0 {
 		vguard = 0
-		if cm.Union { // sharp side: protect the protruding miter tip
+		if cm.Union {
 			tip := r * math.Sqrt(1.5) / math.Pow(3, 1.0/cm.Power)
 			vguard = 1.05 * tip
 		}
 	}
-	// ClipBlend < 0 is the "auto" sentinel: a soft fillet ~0.4×r. 0 = hard crease.
 	clipBlend := sp.ClipBlend
 	if clipBlend < 0 {
 		clipBlend = 0.4 * r
 	}
-	// ClipVBlend < 0 auto: neck the corner ball into the edge over ~r.
 	clipVBlend := sp.ClipVBlend
 	if clipVBlend < 0 {
 		clipVBlend = r
@@ -198,8 +155,7 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	field.ClipVGuard = vguard
 	field.ClipBlend = clipBlend
 	field.ClipVBlend = clipVBlend
-	// The sleeve can bulge up to r + Cap past a vertex; pad the box to clear
-	// that plus a couple of cells so the isosurface never touches the boundary.
+
 	maxSleeve := r + 0.05
 	if sp.Cap > 0 {
 		maxSleeve += sp.Cap
@@ -214,105 +170,73 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 	}
 	tris := MarchingCubes(field, box, sp.Resolution)
 
-	// Optional surface-tension pass: relax the mesh toward a taut, concave
-	// fillet while keeping every vertex outside the tube skeleton (the tubes
-	// act as the film's wire frame). See organic_sleeve_method.md Step 6.
 	if sp.Relax > 0 {
 		tubes := collectTubes(prims, wire)
 		tris = relaxSurfaceTension(tris, tubes, sp.Relax, sp.Lambda)
 	}
 
-	// Render skin as a single material — a warm off-white in the spirit of
-	// polished marble. (User intends to retouch in Blender.)
 	skinMat := newMat(0xeae3d4, false)
 	skin := NewGroup()
 	skin.Mesh = &Mesh{Tris: tris, Mat: skinMat}
 
 	root := NewGroup()
 	root.Add(skin)
-	root.Add(handshakeRoot)
 	return root
 }
 
-// skinStrut: SDF-mode counterpart to buildStrut. Same RNG consumption order
-// so a given seed produces matching geometry between debug and skin modes.
-// No ball joints — strut capsules run anchor-to-anchor and clip into the
-// wireframe / each other via the smooth-min blend.
-func skinStrut(s Settings, topo *CubeTopology, strut Strut, withHandshake bool, rand *Rand, prims *[]Primitive, handshakeRoot *Group, anchorOut *[]Anchor) {
-	half := s.CubeSize / 2
-	a, b := strut.A, strut.B
-	dirAB := b.Sub(a).Normalize()
-	dirBA := dirAB.Neg()
-	aOnSkin := topo.ClassifyBoundary(a, half) >= 1
-	bOnSkin := topo.ClassifyBoundary(b, half) >= 1
-
-	if aOnSkin {
-		faceA := topo.FaceForBoundaryPoint(a, dirBA, half)
-		cls := topo.ClassifyBoundary(a, half)
-		if faceA != nil && cls == 1 {
-			*anchorOut = append(*anchorOut, Anchor{
-				Anchor3D: a, PadR: anchorPadR(s, cls, false), Face: faceA,
-				Kind: "skin", OwnerStrutID: strut.ID,
-			})
+// BuildHandshakeOverlay rebuilds the handshake arm meshes as a separate overlay
+// (not fused into the watertight body). Each handshake follows its strut's
+// current endpoints, and is tinted red when flagged undesirable. Deterministic:
+// no RNG — everything is replayed from the stored SkelHandshake fields.
+func BuildHandshakeOverlay(s Settings, sk *Skeleton) *Group {
+	root := NewGroup()
+	scratch := NewRand(0) // buildArm takes a *Rand but consumes no draws
+	for _, h := range sk.Handshakes {
+		st := sk.strutByID(h.StrutID)
+		if st == nil {
+			continue
 		}
-	} else {
-		*anchorOut = append(*anchorOut, Anchor{
-			Anchor3D: a, PadR: anchorPadR(s, 0, true), Kind: "floating", OwnerStrutID: strut.ID,
-		})
-	}
-	if bOnSkin {
-		faceB := topo.FaceForBoundaryPoint(b, dirAB, half)
-		cls := topo.ClassifyBoundary(b, half)
-		if faceB != nil && cls == 1 {
-			*anchorOut = append(*anchorOut, Anchor{
-				Anchor3D: b, PadR: anchorPadR(s, cls, false), Face: faceB,
-				Kind: "skin", OwnerStrutID: strut.ID,
-			})
+		meet, armPortion, ok := sk.handshakeGeom(h, *st)
+		if !ok || armPortion <= 0 {
+			continue
 		}
-	} else {
-		*anchorOut = append(*anchorOut, Anchor{
-			Anchor3D: b, PadR: anchorPadR(s, 0, true), Kind: "floating", OwnerStrutID: strut.ID,
-		})
-	}
+		a, b := sk.EndA(*st), sk.EndB(*st)
+		dirAB := b.Sub(a).Normalize()
+		towardA := dirAB.Neg()
+		towardB := dirAB
+		shA := meet.Add(towardA.Mul(armPortion))
+		shB := meet.Add(towardB.Mul(armPortion))
 
-	cleanA, cleanB := a, b
-	cleanLen := cleanA.DistTo(cleanB)
-
-	if !withHandshake {
-		*prims = append(*prims, Capsule{A: cleanA, B: cleanB, Radius: s.StrutR})
-		return
+		armA := buildArm(s, armPortion, h.Grip, scratch)
+		armA.Transform.Position = shA
+		armA.Transform.Rotation = QuatFromUnitVectors(V(0, 0, 1), towardB)
+		armA.Transform.Rotation = QuatMul(armA.Transform.Rotation, QuatFromAxisAngle(V(0, 0, 1), h.JitA))
+		armB := buildArm(s, armPortion, h.Grip, scratch)
+		armB.Transform.Position = shB
+		armB.Transform.Rotation = QuatFromUnitVectors(V(0, 0, 1), towardA)
+		armB.Transform.Rotation = QuatMul(armB.Transform.Rotation, QuatFromAxisAngle(V(0, 0, 1), h.JitB))
+		if h.Undesirable {
+			setGroupColor(armA, Colors.CollisionSnap)
+			setGroupColor(armB, Colors.CollisionSnap)
+		}
+		root.Add(armA)
+		root.Add(armB)
 	}
+	return root
+}
 
-	// Handshake — match buildStrut's RNG order so seeds stay equivalent.
-	offset := (rand.F() - 0.5) * cleanLen * 0.15
-	cleanMid := cleanA.Add(cleanB).Mul(0.5)
-	meet := cleanMid.Add(dirAB.Mul(offset))
-	distA := cleanA.DistTo(meet)
-	distB := cleanB.DistTo(meet)
-	armPortion := math.Min(0.5, math.Min(distA*0.55, distB*0.55))
-	towardA := dirAB.Neg()
-	towardB := dirAB
-	shA := meet.Add(towardA.Mul(armPortion))
-	shB := meet.Add(towardB.Mul(armPortion))
-
-	// Stumps as SDF capsules so they blend smoothly into joints.
-	if cleanA.DistTo(shA) > 0.05 {
-		*prims = append(*prims, Capsule{A: cleanA, B: shA, Radius: s.StrutR})
+// setGroupColor recolors every mesh in a group subtree (used to flag an
+// undesirable handshake red without changing buildArm's signature).
+func setGroupColor(g *Group, hex int) {
+	c := hex2rgb(hex)
+	var walk func(n *Group)
+	walk = func(n *Group) {
+		if n.Mesh != nil {
+			n.Mesh.Mat.Color = c
+		}
+		for _, ch := range n.Children {
+			walk(ch)
+		}
 	}
-	if cleanB.DistTo(shB) > 0.05 {
-		*prims = append(*prims, Capsule{A: cleanB, B: shB, Radius: s.StrutR})
-	}
-	grip := gripStyles[int(rand.F()*float64(len(gripStyles)))%len(gripStyles)]
-	_ = rand.F()
-	_ = rand.F()
-	armA := buildArm(s, armPortion, grip, rand)
-	armA.Transform.Position = shA
-	armA.Transform.Rotation = QuatFromUnitVectors(V(0, 0, 1), towardB)
-	armA.Transform.Rotation = QuatMul(armA.Transform.Rotation, QuatFromAxisAngle(V(0, 0, 1), (rand.F()-0.5)*0.4))
-	handshakeRoot.Add(armA)
-	armB := buildArm(s, armPortion, grip, rand)
-	armB.Transform.Position = shB
-	armB.Transform.Rotation = QuatFromUnitVectors(V(0, 0, 1), towardA)
-	armB.Transform.Rotation = QuatMul(armB.Transform.Rotation, QuatFromAxisAngle(V(0, 0, 1), (rand.F()-0.5)*0.4))
-	handshakeRoot.Add(armB)
+	walk(g)
 }
