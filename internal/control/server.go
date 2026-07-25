@@ -9,8 +9,10 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"friendlycube/internal/engine"
 )
@@ -44,6 +46,21 @@ type App struct {
 	meshData    []byte // encoded mesh for /api/mesh (see encodeMesh)
 	meshVersion int    // bumped after each successful rebuild
 	triCount    int
+
+	// buildProgress is the live-render marching-cubes fraction in permille
+	// (0..1000). Written from mesher worker goroutines, read by /api/status;
+	// atomic so it needn't contend for a.mu on every grid slice.
+	buildProgress atomic.Int64
+
+	// Export runs asynchronously so the browser can poll a progress bar; this
+	// state is guarded by its own mutex, independent of the render pipeline.
+	exportMu     sync.Mutex
+	exportActive bool
+	exportDone   bool
+	exportFrac   float64
+	exportPath   string // temp file holding the meshed STL
+	exportName   string // download filename presented to the browser
+	exportErr    string
 
 	buildSignal chan struct{} // buffered(1); coalesces rebuild requests
 }
@@ -85,6 +102,7 @@ func (a *App) worker() {
 		showHS := a.showHandshakes
 		skel := cfg.EffectiveSkeleton().Clone()
 		a.mu.Unlock()
+		a.buildProgress.Store(0)
 
 		s := cfg.ToSettings()
 		mode := cfg.Mode
@@ -98,7 +116,9 @@ func (a *App) worker() {
 		if mode == "debug" {
 			g = engine.BuildSceneFromSkeleton(s, skel)
 		} else {
-			g = engine.BuildSkinFromSkeleton(s, skel, cfg.ToSkinParams(cfg.Skin.Resolution))
+			sp := cfg.ToSkinParams(cfg.Skin.Resolution)
+			sp.Progress = func(f float64) { a.buildProgress.Store(int64(f * 1000)) }
+			g = engine.BuildSkinFromSkeleton(s, skel, sp)
 		}
 		if showHS {
 			g.Add(engine.BuildHandshakeOverlay(s, skel))
@@ -193,6 +213,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/api/regen", a.handleRegen)
 	mux.HandleFunc("/api/spin", a.handleSpin)
 	mux.HandleFunc("/api/export", a.handleExport)
+	mux.HandleFunc("/api/export-progress", a.handleExportProgress)
+	mux.HandleFunc("/api/export-download", a.handleExportDownload)
 	mux.HandleFunc("/api/save", a.handleSave)
 	mux.HandleFunc("/api/load", a.handleLoad)
 	mux.HandleFunc("/api/skeleton", a.handleSkeleton)
@@ -312,6 +334,7 @@ func (a *App) handleStatus(w http.ResponseWriter, r *http.Request) {
 	a.mu.Lock()
 	st := map[string]any{
 		"building":       a.building,
+		"buildProgress":  float64(a.buildProgress.Load()) / 1000,
 		"seed":           a.cfg.Seed,
 		"mode":           a.cfg.Mode,
 		"lastExport":     a.lastExport,
@@ -354,10 +377,13 @@ func (a *App) handleSpin(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"autoSpin": body.On})
 }
 
+// handleExport meshes the STL to a temp file on a background goroutine and
+// returns immediately; the browser polls /api/export-progress for the progress
+// bar, then fetches /api/export-download to save it (the browser owns the
+// filename + save location). Only one export runs at a time.
 func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Path       string `json:"path"`
-		Resolution int    `json:"resolution"`
+		Resolution int `json:"resolution"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&body)
 	cfg, seed := a.Snapshot()
@@ -365,21 +391,110 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 	if res <= 0 {
 		res = cfg.Skin.ExportResolution
 	}
-	path := body.Path
-	if path == "" {
-		path = fmt.Sprintf("lattice-%s.stl", cfg.Seed)
+	filename := fmt.Sprintf("lattice-%s.stl", cfg.Seed)
+
+	a.exportMu.Lock()
+	if a.exportActive {
+		a.exportMu.Unlock()
+		writeJSON(w, map[string]any{"busy": true})
+		return
 	}
-	// Force skin mode for export regardless of the editor's current view.
-	cfg.Mode = "skin"
-	g := cfg.Build(seed, res)
-	if err := engine.WriteBinarySTL(path, g); err != nil {
+	// Drop the previous export's temp file (at most one is ever kept around).
+	if a.exportPath != "" {
+		_ = os.Remove(a.exportPath)
+		a.exportPath = ""
+	}
+	tmp, err := os.CreateTemp("", "friendlycube-*.stl")
+	if err != nil {
+		a.exportMu.Unlock()
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	a.mu.Lock()
-	a.lastExport = path
-	a.mu.Unlock()
-	writeJSON(w, map[string]any{"path": path, "resolution": res})
+	tmpPath := tmp.Name()
+	_ = tmp.Close()
+	a.exportActive = true
+	a.exportDone = false
+	a.exportFrac = 0
+	a.exportErr = ""
+	a.exportPath = tmpPath
+	a.exportName = filename
+	a.exportMu.Unlock()
+
+	// Force skin mode for export regardless of the editor's current view.
+	cfg.Mode = "skin"
+	go func() {
+		progress := func(f float64) {
+			a.exportMu.Lock()
+			a.exportFrac = f
+			a.exportMu.Unlock()
+		}
+		err := cfg.StreamSTL(tmpPath, seed, res, progress)
+		a.exportMu.Lock()
+		a.exportActive = false
+		a.exportDone = true
+		a.exportFrac = 1
+		if err != nil {
+			a.exportErr = err.Error()
+		}
+		a.exportMu.Unlock()
+		if err == nil {
+			a.mu.Lock()
+			a.lastExport = filename
+			a.mu.Unlock()
+		}
+	}()
+
+	writeJSON(w, map[string]any{"started": true, "filename": filename, "resolution": res})
+}
+
+// handleExportDownload streams the most recent finished export as a file
+// attachment, so the browser saves it with its own dialog / download folder.
+// The temp file is kept (not deleted) so the download can be retried; it's
+// cleaned up when the next export starts.
+func (a *App) handleExportDownload(w http.ResponseWriter, r *http.Request) {
+	a.exportMu.Lock()
+	path, name := a.exportPath, a.exportName
+	active, done, errStr := a.exportActive, a.exportDone, a.exportErr
+	a.exportMu.Unlock()
+
+	if active {
+		http.Error(w, "export still running", http.StatusConflict)
+		return
+	}
+	if path == "" || !done || errStr != "" {
+		http.Error(w, "no export available", http.StatusNotFound)
+		return
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	if name == "" {
+		name = "lattice.stl"
+	}
+	if st, err := f.Stat(); err == nil {
+		w.Header().Set("Content-Length", strconv.FormatInt(st.Size(), 10))
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
+	_, _ = io.Copy(w, f)
+}
+
+// handleExportProgress reports the state of the in-flight (or just-finished)
+// export so the browser can drive its progress bar.
+func (a *App) handleExportProgress(w http.ResponseWriter, r *http.Request) {
+	a.exportMu.Lock()
+	st := map[string]any{
+		"active":   a.exportActive,
+		"done":     a.exportDone,
+		"frac":     a.exportFrac,
+		"filename": a.exportName,
+		"error":    a.exportErr,
+	}
+	a.exportMu.Unlock()
+	writeJSON(w, st)
 }
 
 func (a *App) handleSave(w http.ResponseWriter, r *http.Request) {

@@ -45,6 +45,10 @@ type SkinParams struct {
 	// from ~40 (sharp) to ~5.4 (round). Above 0.5 material is removed by a
 	// smooth-max plane cut whose depth and fillet grow toward 1.0.
 	Corner float64
+	// Progress, if non-nil, is called periodically during marching cubes with the
+	// fraction [0,1] of the mesh completed. Used to drive the UI progress bars.
+	// It may be invoked concurrently from worker goroutines.
+	Progress func(float64) `json:"-"`
 }
 
 func DefaultSkinParams() SkinParams {
@@ -95,11 +99,34 @@ func BuildSkin(s Settings, seed uint32, sp SkinParams) *Group {
 // the skeleton. The field/clip/corner-morph/marching-cubes/relax stages are
 // unchanged from the original pipeline.
 func BuildSkinFromSkeleton(s Settings, sk *Skeleton, sp SkinParams) *Group {
+	field, box, prims, wire := skinField(s, sk, sp)
+	tris := MarchingCubes(field, box, sp.Resolution, sp.Progress)
+
+	if sp.Relax > 0 {
+		tubes := collectTubes(prims, wire)
+		tris = relaxSurfaceTension(tris, tubes, sp.Relax, sp.Lambda)
+	}
+
+	skinMat := newMat(skinMatColor, false)
+	skin := NewGroup()
+	skin.Mesh = &Mesh{Tris: tris, Mat: skinMat}
+
+	root := NewGroup()
+	root.Add(skin)
+	return root
+}
+
+// skinMatColor is the base color of the extracted skin (shared by the in-memory
+// build and the streaming STL export so their output matches).
+const skinMatColor = 0xeae3d4
+
+// skinField assembles the signed-distance field and sampling AABB for the skin,
+// plus the strut/wire primitives (needed only for the optional relax pass). It
+// holds all the field/clip/corner-morph setup that used to live inline in
+// BuildSkinFromSkeleton, so the streaming exporter can share it verbatim.
+func skinField(s Settings, sk *Skeleton, sp SkinParams) (field *Field, box AABB, prims, wire []Primitive) {
 	half := s.CubeSize / 2
 	topo := BuildCubeTopology(half)
-
-	var prims []Primitive
-	var wire []Primitive
 
 	// Wireframe: 12 fixed edge capsules at strut radius. Hard-min'd + corner-
 	// morphed so the three caps at each vertex form one exact sphere.
@@ -122,7 +149,7 @@ func BuildSkinFromSkeleton(s Settings, sk *Skeleton, sp SkinParams) *Group {
 		r = s.StrutR
 	}
 	cm := cornerMorphFromSlider(sp.Corner, half, r)
-	field := &Field{
+	field = &Field{
 		Prims:   prims,
 		Wire:    wire,
 		Corners: cm,
@@ -164,24 +191,11 @@ func BuildSkinFromSkeleton(s Settings, sk *Skeleton, sp SkinParams) *Group {
 	if pad < maxSleeve {
 		pad = maxSleeve
 	}
-	box := AABB{
+	box = AABB{
 		Min: V(-half-pad, -half-pad, -half-pad),
 		Max: V(half+pad, half+pad, half+pad),
 	}
-	tris := MarchingCubes(field, box, sp.Resolution)
-
-	if sp.Relax > 0 {
-		tubes := collectTubes(prims, wire)
-		tris = relaxSurfaceTension(tris, tubes, sp.Relax, sp.Lambda)
-	}
-
-	skinMat := newMat(0xeae3d4, false)
-	skin := NewGroup()
-	skin.Mesh = &Mesh{Tris: tris, Mat: skinMat}
-
-	root := NewGroup()
-	root.Add(skin)
-	return root
+	return field, box, prims, wire
 }
 
 // BuildHandshakeOverlay rebuilds the handshake arm meshes as a separate overlay

@@ -7,9 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"runtime"
+	"sync/atomic"
 
 	"friendlycube/internal/control"
-	"friendlycube/internal/engine"
 )
 
 func main() {
@@ -43,8 +43,24 @@ func main() {
 			seed = control.RandomSeed()
 		}
 		cfg.EnsureGeneratedSkeleton(seed)
-		g := cfg.Build(seed, cfg.Skin.ExportResolution)
-		if err := engine.WriteBinarySTL(*stlOnly, g); err != nil {
+		var lastPct atomic.Int64
+		lastPct.Store(-1)
+		progress := func(f float64) {
+			pct := int64(f * 100)
+			for {
+				old := lastPct.Load()
+				if pct <= old {
+					return
+				}
+				if lastPct.CompareAndSwap(old, pct) {
+					fmt.Fprintf(os.Stderr, "\rmeshing… %3d%%", pct)
+					return
+				}
+			}
+		}
+		err := cfg.StreamSTL(*stlOnly, seed, cfg.Skin.ExportResolution, progress)
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
 			log.Fatalf("stl: %v", err)
 		}
 		fmt.Printf("wrote %s (seed=%06x, res=%d)\n", *stlOnly, seed, cfg.Skin.ExportResolution)

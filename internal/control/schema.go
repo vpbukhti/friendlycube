@@ -105,7 +105,7 @@ func Schema() []SchemaGroup {
 		{Title: "Meshing", Params: []Param{
 			{Key: "resolution", Label: "Preview detail", Kind: "int", Min: 48, Max: 320, Step: 8, Rebuild: true,
 				Help: "Detail of the live preview. Higher looks smoother but takes longer to redraw after each change."},
-			{Key: "exportResolution", Label: "Export detail", Kind: "int", Min: 64, Max: 512, Step: 8, Rebuild: false,
+			{Key: "exportResolution", Label: "Export detail", Kind: "int", Min: 64, Max: 2048, Step: 8, Rebuild: false,
 				Help: "Detail of the saved model file. Higher gives a finer print but a bigger file and slower export."},
 			{Key: "padding", Label: "Box padding", Kind: "float", Min: 0, Max: 1, Step: 0.05, Rebuild: true,
 				Help: "Extra empty space kept around the sculpture so it never touches the edge of the build box."},

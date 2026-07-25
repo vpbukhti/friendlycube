@@ -266,22 +266,24 @@ func (c Config) EffectiveSkeleton() *engine.Skeleton {
 	return c.Frame.GeneratedSkeleton
 }
 
-// Build produces the geometry for the given seed at the given resolution,
-// dispatching on Mode. It bakes the skeleton if neither is present (headless
-// path). The handshake overlay is always included here (headless export shows
-// handshakes); the live server composes the overlay conditionally instead.
-func (c Config) Build(seed uint32, res int) *engine.Group {
+// StreamSTL writes the geometry directly to an STL file at `path`, streaming it
+// slab by slab so peak memory stays O(res²) instead of O(res³) — the path to
+// take for exports (especially at high resolution). It mirrors Build's skeleton
+// bake and always includes the handshake overlay. Debug mode has no streaming
+// mesher, so it falls back to the in-memory Build + write.
+func (c Config) StreamSTL(path string, seed uint32, res int, progress func(float64)) error {
 	if c.Frame.GeneratedSkeleton == nil && c.Frame.ModifiedSkeleton == nil {
 		c.Frame.GeneratedSkeleton = engine.BakeSkeleton(c.ToSettings(), seed)
 	}
 	s := c.ToSettings()
 	skel := c.EffectiveSkeleton()
-	var root *engine.Group
 	if c.Mode == "debug" {
-		root = engine.BuildSceneFromSkeleton(s, skel)
-	} else {
-		root = engine.BuildSkinFromSkeleton(s, skel, c.ToSkinParams(res))
+		g := engine.BuildSceneFromSkeleton(s, skel)
+		g.Add(engine.BuildHandshakeOverlay(s, skel))
+		return engine.WriteBinarySTL(path, g)
 	}
-	root.Add(engine.BuildHandshakeOverlay(s, skel))
-	return root
+	sp := c.ToSkinParams(res)
+	sp.Progress = progress
+	overlay := engine.BuildHandshakeOverlay(s, skel)
+	return engine.StreamSkinSTL(path, s, skel, sp, overlay)
 }

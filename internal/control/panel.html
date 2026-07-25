@@ -49,6 +49,24 @@
     background:var(--panel);border:1px solid var(--accent2);border-radius:8px;
     padding:9px 14px;opacity:0;transition:opacity .2s;pointer-events:none}
   .toast.on{opacity:1}
+  /* progress bars (live render indicator + export) */
+  .pbar{display:inline-block;width:84px;height:6px;border-radius:4px;background:var(--line);
+    overflow:hidden;vertical-align:middle;margin-left:5px}
+  .pbar>i{display:block;height:100%;width:0;background:var(--accent2);transition:width .15s linear}
+  /* export popover */
+  .pop{position:fixed;top:56px;right:14px;width:288px;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;padding:13px 14px;z-index:60;
+    box-shadow:0 10px 30px rgba(0,0,0,.55);display:none}
+  .pop.on{display:block}
+  .pop h3{margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:.9px;color:var(--mut)}
+  .pop label{display:block;font-size:11px;color:var(--mut);margin-bottom:4px}
+  .pop .prow{margin-bottom:11px}
+  .pop .stat{font-size:11px;color:var(--mut);min-height:14px;margin-top:9px;line-height:1.4}
+  .pop .stat.err{color:#f2b6b5}
+  .exbar{width:100%;height:9px;border-radius:5px;background:var(--line);overflow:hidden;
+    margin-top:11px;display:none}
+  .exbar.on{display:block}
+  .exbar>i{display:block;height:100%;width:0;background:var(--accent2);transition:width .15s linear}
   .adv-tog{color:var(--mut);font-size:10.5px;cursor:pointer;user-select:none;
     padding:1px 0 5px 122px}
   .adv-tog:hover{color:var(--accent2)}
@@ -76,7 +94,7 @@
   <h1>friendlycube</h1>
   <span class="badge">seed <b id="seed">—</b></span>
   <span class="badge">tris <b id="tris">0</b></span>
-  <span id="building" class="badge">● rendering…</span>
+  <span id="building" class="badge">● rendering…<span class="pbar"><i id="buildFill"></i></span></span>
   <span class="sp"></span>
   <button id="edit">Edit frame</button>
   <button id="regen">Regenerate</button>
@@ -114,6 +132,11 @@
     </div>
     <div id="paramgroups"></div>
   </div>
+</div>
+<div class="pop" id="exportCard">
+  <h3>Export STL</h3>
+  <div class="exbar on" id="exportBar"><i></i></div>
+  <div class="stat" id="exportStat"></div>
 </div>
 <div id="tip"></div>
 <div class="toast" id="toast"></div>
@@ -281,9 +304,47 @@ function applyEditLock(){
 $('#regen').onclick=async()=>{const r=await jpost('/api/regen');cfg.seed=r.seed;
   const f=$('#f_seed');if(f)f.value=r.seed; appState.modified=false; if(appState.on) await loadSkeleton();
   toast('regenerated · '+r.seed);};
-$('#export').onclick=async()=>{toast('exporting @ '+cfgGet('exportResolution')+'…');
+// ---- export + progress ----
+// Meshing happens server-side into a temp file (progress polled below); when
+// it's done we let the BROWSER download it via /api/export-download, so the
+// filename + save location are entirely the browser's business — nothing to
+// remember or persist on our side.
+let exporting=false;
+async function startExport(){
+  if(exporting)return;
+  const btn=$('#export'), card=$('#exportCard'), fill=$('#exportBar').querySelector('i'), stat=$('#exportStat');
+  const oldTxt=btn.textContent;
+  card.classList.add('on'); fill.style.width='0%'; stat.classList.remove('err');
+  stat.textContent='meshing @ detail '+cfgGet('exportResolution')+'…';
   const r=await jpost('/api/export',{resolution:cfgGet('exportResolution')});
-  toast(r.path?('exported '+r.path):'export failed');};
+  if(r&&r.busy){stat.textContent='an export is already running…';return;}
+  exporting=true; btn.disabled=true; btn.textContent='Exporting…';
+  pollExport(fill,stat,btn,oldTxt);
+}
+$('#export').onclick=startExport;
+async function pollExport(fill,stat,btn,oldTxt){
+  try{
+    const p=await jget('/api/export-progress');
+    fill.style.width=Math.round((p.frac||0)*100)+'%';
+    if(p.done){
+      exporting=false; btn.disabled=false; btn.textContent=oldTxt;
+      if(p.error){stat.classList.add('err');stat.textContent='export failed: '+p.error;}
+      else{
+        stat.textContent='downloading '+p.filename+' …';
+        downloadExport(p.filename);
+        toast('exported '+p.filename);
+        setTimeout(()=>$('#exportCard').classList.remove('on'),2500);
+      }
+      return;
+    }
+  }catch(e){}
+  setTimeout(()=>pollExport(fill,stat,btn,oldTxt),200);
+}
+function downloadExport(name){
+  const a=document.createElement('a');
+  a.href='/api/export-download'; a.download=name||'lattice.stl';
+  document.body.appendChild(a); a.click(); a.remove();
+}
 $('#save').onclick=async()=>{const p=prompt('Save config to:','config.json');if(p===null)return;
   const r=await jpost('/api/save',{path:p});toast('saved '+r.path);};
 $('#load').onclick=async()=>{const p=prompt('Load config from:','config.json');if(p===null)return;
@@ -932,6 +993,7 @@ async function poll(){
     $('#seed').textContent=s.seed||'—';
     $('#tris').textContent=(s.tris||0).toLocaleString();
     $('#building').classList.toggle('on',!!s.building);
+    if(s.building) $('#buildFill').style.width=Math.round((s.buildProgress||0)*100)+'%';
     appState.modified=!!s.modified;
     if(typeof s.showHandshakes==='boolean')appState.showHandshakes=s.showHandshakes;
     if(s.seed && cfg.seed!==s.seed){cfg.seed=s.seed;const f=$('#f_seed');if(f)f.value=s.seed;}
