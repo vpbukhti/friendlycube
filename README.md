@@ -84,6 +84,57 @@ The cube's 12 edges and 8 corners are the fixed frame — they're never editable
 Once you hand-edit, the explicit skeleton becomes the source of truth; changing a
 structural parameter (or Regenerate) asks before discarding your edits.
 
+## Print split
+
+Mode **split** cuts the sculpture into pieces that each print without supports,
+glued back together on keyed joints. How it works is in
+[PIPELINE.md](PIPELINE.md#print-split).
+
+- **Cuts are exact.** The skin is cut like Blender's bisect: each cut face is
+  triangulated in the cut plane itself, so faces are flat with sharp rims.
+  Every piece is one closed shell.
+- **Struts and edges stay whole between vertices.** They are only cut near the
+  places where thick tubes meet. A single support landing on a strut doesn't cut
+  it: the support is cut off close to the strut and leaves a short stub.
+- **Strut pieces** stand on one of their cuts. No surface leans out more than
+  **15°** past vertical, so each cut sits just where a joint's flare begins.
+- **Joint pieces** print whole on one of their faces when they can, with
+  overhangs up to **35°**. If a joint can't print whole, it is cut in half,
+  once, by the best plane found. The fillet where a support meets a tube counts
+  as joint too (35°), which keeps support stubs short.
+- **Merging:** neighbouring pieces are joined back together whenever the result
+  still prints, so you glue fewer joints.
+- **Guide rods:** every cut gets one or two rods. The main rod is a 4 mm
+  trapezoid 8 mm long; a 2.9 mm rod 6 mm long is used where the main one
+  doesn't fit.
+  Rods leave 0.1 mm on every side in their sockets (adjustable), print lying on their flat side, and
+  are interchangeable within each size.
+- **Dash keys:** where a cut face has no room for a rod and its number
+  together, the bar under the number becomes a groove (1 × 3 mm, 1.2 mm deep)
+  in both faces, and a loose key (0.8 × 2.8 × 2.0 mm, `key-dash.stl`)
+  sits half in each. All dash keys are the same size.
+- **Numbers:** each cut's number is engraved into both of its faces, as vector
+  outlines cut into the face. The bar under a number marks its bottom edge.
+  Where a joint's split plane crosses a cut face, the rod and number may
+  straddle the seam (glue the two halves first). Every joint gets a number;
+  `parts.txt` lists them all too.
+
+In the view, pieces are see-through and the rods inside them are solid. Hover a
+piece to bring it forward and list its cuts; **Explode** pulls the pieces apart.
+Pieces that can't be made printable within the limits are drawn red.
+
+**Export pieces** downloads two files:
+- `lattice-<seed>-split.stl`: every piece where it sits in the cube, with the
+  rods in their sockets, as separate bodies in one file. Arranging them on the
+  bed is left to the slicer.
+- `lattice-<seed>-split.tar`: one STL per numbered piece, each standing on its
+  print face at z = 0, the rod and dash key STLs and `parts.txt`, which lists every piece
+  with its cuts, neighbours and rods.
+
+At the default 150 mm cube expect about 80 pieces and 110 glued joints, and an
+export of about a minute. Raising **Strut overhang °** or lowering **Strut
+count** / support settings reduces both.
+
 ## Configuration
 
 All parameters live in one JSON config, split into two halves: **`skin`** (the
@@ -122,6 +173,7 @@ Skip the window entirely and write an STL:
 | `-config` | `config.default.json` | JSON config path (absent/`null` keys → baked-in defaults) |
 | `-seed` | *(empty)* | hex seed override, e.g. `1a2b3c`; empty = use config, else random |
 | `-stl` | *(empty)* | if set, write an STL to this path (headless) and exit |
+| `-split` | *(empty)* | if set, split into printable pieces, write `<path>.stl` + `<path>.tar`, and exit |
 | `-addr` | `127.0.0.1:8730` | address for the panel + WebGL server |
 | `-open` | `true` | open the panel in the default browser on start |
 

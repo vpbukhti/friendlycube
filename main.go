@@ -16,6 +16,7 @@ func main() {
 	configPath := flag.String("config", "config.default.json", "path to a JSON config (absent keys / null → baked-in defaults)")
 	seedFlag := flag.String("seed", "", "hex seed override (e.g. 1a2b3c). Empty = use config / random.")
 	stlOnly := flag.String("stl", "", "if set, write STL to this path (headless) and exit")
+	splitOut := flag.String("split", "", "if set, split into printable pieces and write <path>.stl (all pieces) + <path>.tar (numbered pieces, rods, parts list), then exit")
 	addr := flag.String("addr", "127.0.0.1:8730", "address for the control-panel + WebGL web server")
 	open := flag.Bool("open", true, "open the panel in the default browser on start")
 	flag.Parse()
@@ -34,6 +35,28 @@ func main() {
 	}
 	if *seedFlag != "" {
 		cfg.Seed = *seedFlag
+	}
+
+	// Headless print split: plan, mesh every piece, write both files.
+	if *splitOut != "" {
+		seed, ok := control.ParseSeed(cfg.Seed)
+		if !ok {
+			seed = control.RandomSeed()
+		}
+		cfg.EnsureGeneratedSkeleton(seed)
+		plan := cfg.PlanSplit(func(f float64) { fmt.Fprintf(os.Stderr, "\rplanning… %3d%%", int(f*100)) })
+		fmt.Fprintln(os.Stderr)
+		info := plan.Info()
+		fmt.Printf("%d pieces, %d cuts, rods: %d main + %d thin, %d dash keys, %d pieces need support\n",
+			len(info.Pieces), len(info.Cuts), info.RodsMain, info.RodsThin, info.DashKeys, info.Flagged)
+		err := plan.ExportSplit(*splitOut+".stl", *splitOut+".tar", cfg.Print.VoxelMM,
+			func(f float64) { fmt.Fprintf(os.Stderr, "\rmeshing pieces… %3d%%", int(f*100)) })
+		fmt.Fprintln(os.Stderr)
+		if err != nil {
+			log.Fatalf("split: %v", err)
+		}
+		fmt.Printf("wrote %s.stl and %s.tar (seed=%06x, cell=%.2f mm)\n", *splitOut, *splitOut, seed, cfg.Print.VoxelMM)
+		return
 	}
 
 	// Headless: build once at export resolution and write the STL.

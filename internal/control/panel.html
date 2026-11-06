@@ -87,6 +87,20 @@
   #editsel .val{color:var(--accent2)}
   #editsel .warnflag{color:var(--warn)}
   .mini{font-size:11px;color:var(--mut);margin-top:6px;line-height:1.5}
+  /* split view */
+  #cutLabels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+  .cutlbl{position:absolute;transform:translate(-50%,-50%);background:#15151a;border:1px solid var(--accent2);
+    color:var(--accent2);border-radius:5px;padding:0 4px;font-size:10.5px;white-space:nowrap}
+  .cutlbl.dim{border-color:var(--mut);color:var(--mut)}
+  #splitSum{position:absolute;left:12px;top:10px;color:var(--mut);font-size:11px;display:none;pointer-events:none}
+  #splitSum .warnflag{color:var(--warn)}
+  #splitCard{position:absolute;right:12px;top:12px;width:270px;background:rgba(32,32,35,.94);
+    border:1px solid var(--line);border-radius:9px;padding:9px 11px;font-size:12px;display:none;pointer-events:none}
+  #splitCard.on{display:block}
+  #splitCard .t{color:var(--accent);font-weight:600}
+  #splitCard .k{color:var(--mut)}
+  #splitCard .warnflag{color:var(--warn)}
+  #splitCard ul{margin:6px 0 0;padding-left:16px;max-height:220px;overflow:hidden}
 </style>
 </head>
 <body>
@@ -106,6 +120,9 @@
   <div id="view">
     <canvas id="gl"></canvas>
     <div id="hint">drag to orbit · scroll to zoom</div>
+    <div id="cutLabels"></div>
+    <div id="splitSum"></div>
+    <div id="splitCard"></div>
   </div>
   <div id="panel">
     <div id="editbar">
@@ -162,11 +179,15 @@ const FRAME_KEYS=['cubeSize','strutR','buttressR','target','minClearance','mix',
  'neighborWeight','edgeBias','lf100','lf95','lf90','lf85','lf70'];
 FRAME_KEYS.forEach(k=>KEY_GROUP[k]='frame');
 const FRAME_SET=new Set(FRAME_KEYS);
+['cubeMM','strutTilt','jointTilt','clearance','planVoxelMM','voxelMM','minPieceMM','merge','engrave',
+ 'engraveDepthMM','explode'].forEach(k=>KEY_GROUP[k]='print');
 function cfgGet(k){const g=KEY_GROUP[k];
-  if(g==='skin')return (cfg.skin||{})[k]; if(g==='frame')return (cfg.frame||{})[k]; return cfg[k];}
+  if(g==='skin')return (cfg.skin||{})[k]; if(g==='frame')return (cfg.frame||{})[k];
+  if(g==='print')return (cfg.print||{})[k]; return cfg[k];}
 function cfgSet(k,v){const g=KEY_GROUP[k];
   if(g==='skin'){cfg.skin=cfg.skin||{};cfg.skin[k]=v;}
   else if(g==='frame'){cfg.frame=cfg.frame||{};cfg.frame[k]=v;}
+  else if(g==='print'){cfg.print=cfg.print||{};cfg.print[k]=v;}
   else cfg[k]=v;}
 // A key is "structural" if changing it can alter the generated frame skeleton.
 function isStructural(k){return k==='seed'||FRAME_SET.has(k);}
@@ -316,6 +337,7 @@ async function startExport(){
   const oldTxt=btn.textContent;
   card.classList.add('on'); fill.style.width='0%'; stat.classList.remove('err');
   stat.textContent='meshing @ detail '+cfgGet('exportResolution')+'…';
+  if(cfg.mode==='split') stat.textContent='meshing pieces @ '+cfgGet('voxelMM')+' mm…';
   const r=await jpost('/api/export',{resolution:cfgGet('exportResolution')});
   if(r&&r.busy){stat.textContent='an export is already running…';return;}
   exporting=true; btn.disabled=true; btn.textContent='Exporting…';
@@ -330,8 +352,10 @@ async function pollExport(fill,stat,btn,oldTxt){
       exporting=false; btn.disabled=false; btn.textContent=oldTxt;
       if(p.error){stat.classList.add('err');stat.textContent='export failed: '+p.error;}
       else{
-        stat.textContent='downloading '+p.filename+' …';
+        stat.textContent='downloading '+p.filename+(p.tarname?' + '+p.tarname:'')+' …';
         downloadExport(p.filename);
+        // split export: a second file (numbered pieces + rods + parts list)
+        if(p.tarname) setTimeout(()=>downloadExport(p.tarname,'tar'),900);
         toast('exported '+p.filename);
         setTimeout(()=>$('#exportCard').classList.remove('on'),2500);
       }
@@ -340,9 +364,9 @@ async function pollExport(fill,stat,btn,oldTxt){
   }catch(e){}
   setTimeout(()=>pollExport(fill,stat,btn,oldTxt),200);
 }
-function downloadExport(name){
+function downloadExport(name,file){
   const a=document.createElement('a');
-  a.href='/api/export-download'; a.download=name||'lattice.stl';
+  a.href='/api/export-download'+(file?'?file='+file:''); a.download=name||'lattice.stl';
   document.body.appendChild(a); a.click(); a.remove();
 }
 $('#save').onclick=async()=>{const p=prompt('Save config to:','config.json');if(p===null)return;
@@ -355,18 +379,20 @@ $('#load').onclick=async()=>{const p=prompt('Load config from:','config.json');i
 const canvas=$('#gl');
 const gl=canvas.getContext('webgl',{antialias:true,depth:true});
 const VERT=`
-attribute vec3 aPos; attribute vec3 aNormal; attribute vec3 aColor;
-uniform mat4 uMVP; uniform mat4 uModel; uniform mat3 uNormalMat;
+attribute vec3 aPos; attribute vec3 aNormal; attribute vec3 aColor; attribute vec3 aOffset;
+uniform mat4 uMVP; uniform mat4 uModel; uniform mat3 uNormalMat; uniform float uExplode;
 varying vec3 vNormal; varying vec3 vWorldPos; varying vec3 vColor;
-void main(){ vNormal=normalize(uNormalMat*aNormal);
-  vWorldPos=(uModel*vec4(aPos,1.0)).xyz; vColor=aColor;
-  gl_Position=uMVP*vec4(aPos,1.0); }`;
+void main(){ vec3 p=aPos+aOffset*uExplode; vNormal=normalize(uNormalMat*aNormal);
+  vWorldPos=(uModel*vec4(p,1.0)).xyz; vColor=aColor;
+  gl_Position=uMVP*vec4(p,1.0); }`;
 const FRAG=`
 precision mediump float;
 varying vec3 vNormal; varying vec3 vWorldPos; varying vec3 vColor;
 uniform vec3 uCamPos; uniform vec3 uLightDirs[3]; uniform vec3 uLightCols[3]; uniform vec3 uAmbient;
+uniform float uAlpha;
 void main(){
   vec3 N=normalize(vNormal); vec3 V=normalize(uCamPos-vWorldPos);
+  if(!gl_FrontFacing) N=-N;
   vec3 lit=uAmbient*vColor;
   for(int i=0;i<3;i++){
     vec3 L=normalize(-uLightDirs[i]);
@@ -377,8 +403,14 @@ void main(){
     float spec=pow(max(dot(N,H),0.0),32.0)*0.15;
     lit+=diffuse+uLightCols[i]*spec;
   }
-  gl_FragColor=vec4(pow(lit,vec3(1.0/1.6)),1.0);
+  gl_FragColor=vec4(pow(lit,vec3(1.0/1.6)),uAlpha);
 }`;
+// Split view picking: each piece renders its ID as a color.
+const VERTP=`attribute vec3 aPos; attribute float aPiece; attribute vec3 aOffset;
+uniform mat4 uMVP; uniform float uExplode; varying float vPiece;
+void main(){ vPiece=aPiece; gl_Position=uMVP*vec4(aPos+aOffset*uExplode,1.0); }`;
+const FRAGP=`precision highp float; varying float vPiece;
+void main(){ float id=floor(vPiece+0.5); gl_FragColor=vec4(mod(id,256.0)/255.0,floor(id/256.0)/255.0,0.0,1.0); }`;
 // Flat-color program for the editor overlay (lines + points, no lighting).
 const VERT2=`attribute vec3 aPos; uniform mat4 uMVP; uniform float uPS;
 void main(){ gl_Position=uMVP*vec4(aPos,1.0); gl_PointSize=uPS; }`;
@@ -388,6 +420,7 @@ function sh(type,src){const s=gl.createShader(type);gl.shaderSource(s,src);gl.co
   if(!gl.getShaderParameter(s,gl.COMPILE_STATUS))throw gl.getShaderInfoLog(s);return s;}
 function makeProg(v,f){const p=gl.createProgram();
   gl.attachShader(p,sh(gl.VERTEX_SHADER,v));gl.attachShader(p,sh(gl.FRAGMENT_SHADER,f));
+  gl.bindAttribLocation(p,0,'aPos'); // attribute 0 must always be an enabled array
   gl.linkProgram(p);return p;}
 const prog=makeProg(VERT,FRAG);
 gl.useProgram(prog);
@@ -397,7 +430,14 @@ const loc={
   uNormalMat:gl.getUniformLocation(prog,'uNormalMat'), uCamPos:gl.getUniformLocation(prog,'uCamPos'),
   uLightDirs:gl.getUniformLocation(prog,'uLightDirs'), uLightCols:gl.getUniformLocation(prog,'uLightCols'),
   uAmbient:gl.getUniformLocation(prog,'uAmbient'),
+  aOffset:gl.getAttribLocation(prog,'aOffset'), uExplode:gl.getUniformLocation(prog,'uExplode'),
+  uAlpha:gl.getUniformLocation(prog,'uAlpha'),
 };
+const progP=makeProg(VERTP,FRAGP);
+const locP={aPos:gl.getAttribLocation(progP,'aPos'),aPiece:gl.getAttribLocation(progP,'aPiece'),
+  aOffset:gl.getAttribLocation(progP,'aOffset'),uMVP:gl.getUniformLocation(progP,'uMVP'),
+  uExplode:gl.getUniformLocation(progP,'uExplode')};
+const pidBuf=gl.createBuffer(),offBuf=gl.createBuffer();
 const prog2=makeProg(VERT2,FRAG2);
 const loc2={aPos:gl.getAttribLocation(prog2,'aPos'),uMVP:gl.getUniformLocation(prog2,'uMVP'),
   uPS:gl.getUniformLocation(prog2,'uPS'),uColor:gl.getUniformLocation(prog2,'uColor')};
@@ -513,7 +553,111 @@ async function loadMesh(){
     gl.bindBuffer(gl.ARRAY_BUFFER,nrmBuf); gl.bufferData(gl.ARRAY_BUFFER,f.subarray(3*V,6*V),gl.DYNAMIC_DRAW);
     gl.bindBuffer(gl.ARRAY_BUFFER,colBuf); gl.bufferData(gl.ARRAY_BUFFER,f.subarray(6*V,9*V),gl.DYNAMIC_DRAW);
   }
+  split.on=V>0 && f_len(buf)>=13*V;
+  if(split.on){
+    const f=new Float32Array(buf,4), pid=f.subarray(9*V,10*V);
+    gl.bindBuffer(gl.ARRAY_BUFFER,pidBuf); gl.bufferData(gl.ARRAY_BUFFER,pid,gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER,offBuf); gl.bufferData(gl.ARRAY_BUFFER,f.subarray(10*V,13*V),gl.DYNAMIC_DRAW);
+    // Vertices are grouped: rods (ID 0) first, then each piece contiguously.
+    split.ranges=new Map(); split.rodVerts=0;
+    for(let i=0;i<V;){const id=pid[i]; let j=i; while(j<V&&pid[j]===id)j++;
+      if(id===0) split.rodVerts=j; else split.ranges.set(id,[i,j-i]); i=j;}
+    split.info=await jget('/api/split');
+    split.pieces=new Map((split.info.pieces||[]).map(p=>[p.id,p]));
+    renderSplitSum(); setHover(0);
+  } else { split.info=null; renderSplitSum(); setHover(0); }
   loadedVersion=parseInt(resp.headers.get('X-Mesh-Version')||'0',10);
+}
+function f_len(buf){return (buf.byteLength-4)/4;}
+function bindAttr1(l,b){gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,1,gl.FLOAT,false,0,0);}
+
+/* ---------------- split view ---------------- */
+// Pieces draw see-through (rods inside them opaque); hovering a piece makes it
+// mostly opaque and lists its cuts. Picking renders piece IDs offscreen.
+const split={on:false, ranges:new Map(), rodVerts:0, info:null, pieces:new Map(), hover:0,
+  mouse:null, pickDue:false, lastPick:0, fbo:null, fbW:0, fbH:0, labels:[]};
+function explodeAmt(){return split.on?(+cfgGet('explode')||0):0;}
+function renderSplitSum(){
+  const el=$('#splitSum'), i=split.info;
+  if(!split.on||!i||!i.pieces){el.style.display='none';return;}
+  const cuts=(i.cuts||[]).filter(c=>c.num>0).length;
+  el.innerHTML=`${i.pieces.length} pieces · ${cuts} cuts · rods ${i.rodsMain} main + ${i.rodsThin} thin`+(i.dashKeys?` · ${i.dashKeys} dash keys`:'')+
+    (i.flagged?` · <span class="warnflag">${i.flagged} need support</span>`:'');
+  el.style.display='block';
+}
+function setHover(id){
+  if(id===split.hover && id!==0)return;
+  split.hover=id;
+  const card=$('#splitCard'), box=$('#cutLabels'); box.innerHTML=''; split.labels=[];
+  const p=split.pieces.get(id);
+  if(!split.on||!p){card.classList.remove('on');return;}
+  const sideA=c=>c.sideA||[c.a], sideB=c=>c.sideB||[c.b];
+  const cuts=(split.info.cuts||[]).filter(c=>sideA(c).includes(id)||sideB(c).includes(id));
+  const name=x=>(split.pieces.get(x)||{}).name||'?';
+  const rows=cuts.map(c=>{const others=sideA(c).includes(id)?sideB(c):sideA(c);
+    const what=c.num>0?('cut '+c.num+(c.hasLabel?'':' <span class="k">(no number)</span>')):'<span class="k">glue only</span>';
+    const rod=c.rod==='dash'?'1 dash key':c.rod?(c.keys+' '+c.rod+' rod'+(c.keys>1?'s':'')):'no rod';
+    return `<li>${what} → ${others.map(name).join(' + ')} <span class="k">· ${rod}</span></li>`;});
+  card.innerHTML=`<div class="t">${p.name}</div><div class="k">${p.desc}</div>`+
+    (p.flagged?`<div class="warnflag">${p.overhang} mm² overhang above the limit — needs support</div>`:'')+
+    `<ul>${rows.join('')}</ul>`;
+  card.classList.add('on');
+  for(const c of cuts){ if(c.num<=0)continue;
+    const el=document.createElement('div'); el.className='cutlbl'+(c.hasLabel?'':' dim'); el.textContent=c.num;
+    box.appendChild(el); split.labels.push({el,pos:c.pos});}
+}
+function placeCutLabels(){
+  if(!split.labels.length)return;
+  const p=split.pieces.get(split.hover), e=explodeAmt(), c=p?p.centroid:[0,0,0];
+  for(const l of split.labels){
+    const s=worldToCSS([l.pos[0]+c[0]*e,l.pos[1]+c[1]*e,l.pos[2]+c[2]*e]);
+    l.el.style.display=s.w>0?'block':'none'; l.el.style.left=s.x+'px'; l.el.style.top=s.y+'px';}
+}
+function pickPiece(mx,my){
+  const dpr=canvas.width/Math.max(1,canvas.clientWidth);
+  if(!split.fbo||split.fbW!==canvas.width||split.fbH!==canvas.height){
+    if(split.fbo){gl.deleteFramebuffer(split.fbo.f);gl.deleteTexture(split.fbo.t);gl.deleteRenderbuffer(split.fbo.d);}
+    const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,canvas.width,canvas.height,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.NEAREST);
+    const d=gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER,d);
+    gl.renderbufferStorage(gl.RENDERBUFFER,gl.DEPTH_COMPONENT16,canvas.width,canvas.height);
+    const f=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,d);
+    split.fbo={f,t,d}; split.fbW=canvas.width; split.fbH=canvas.height;
+  }
+  gl.bindFramebuffer(gl.FRAMEBUFFER,split.fbo.f);
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+  gl.useProgram(progP);
+  gl.uniformMatrix4fv(locP.uMVP,false,curMVP); gl.uniform1f(locP.uExplode,explodeAmt());
+  bindAttr(locP.aPos,posBuf); bindAttr1(locP.aPiece,pidBuf); bindAttr(locP.aOffset,offBuf);
+  gl.drawArrays(gl.TRIANGLES,0,vertexCount);
+  const px=new Uint8Array(4);
+  gl.readPixels(Math.floor(mx*dpr),Math.floor((curCH-my)*dpr),1,1,gl.RGBA,gl.UNSIGNED_BYTE,px);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+  gl.disableVertexAttribArray(locP.aPiece);
+  return px[3]?px[0]+px[1]*256:0;
+}
+canvas.addEventListener('mousemove',e=>{ if(!split.on||dragging)return;
+  split.mouse=mouseCSS(e); split.pickDue=true; });
+canvas.addEventListener('mouseleave',()=>{ split.mouse=null; if(split.on) setHover(0); });
+function drawSplit(){
+  // rods: opaque, writing depth
+  gl.uniform1f(loc.uExplode,explodeAmt());
+  bindAttr(loc.aOffset,offBuf);
+  gl.uniform1f(loc.uAlpha,1);
+  if(split.rodVerts>0) gl.drawArrays(gl.TRIANGLES,0,split.rodVerts);
+  // pieces: see-through, front faces only, no depth writes; hovered last
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+  gl.depthMask(false); gl.enable(gl.CULL_FACE); gl.cullFace(gl.BACK);
+  gl.uniform1f(loc.uAlpha,0.35);
+  for(const [id,r] of split.ranges){ if(id!==split.hover) gl.drawArrays(gl.TRIANGLES,r[0],r[1]); }
+  const h=split.ranges.get(split.hover);
+  if(h){ gl.uniform1f(loc.uAlpha,0.75); gl.drawArrays(gl.TRIANGLES,h[0],h[1]); }
+  gl.depthMask(true); gl.disable(gl.BLEND); gl.disable(gl.CULL_FACE);
+  gl.disableVertexAttribArray(loc.aOffset);
 }
 function bindAttr(l,b){gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.enableVertexAttribArray(l);gl.vertexAttribPointer(l,3,gl.FLOAT,false,0,0);}
 
@@ -561,8 +705,16 @@ function frame(now){
     gl.uniform3fv(loc.uLightCols,lightCols);
     gl.uniform3fv(loc.uAmbient,new Float32Array([0.5,0.5,0.5]));
     bindAttr(loc.aPos,posBuf); bindAttr(loc.aNormal,nrmBuf); bindAttr(loc.aColor,colBuf);
-    gl.drawArrays(gl.TRIANGLES,0,vertexCount);
+    if(split.on){ drawSplit(); }
+    else{
+      gl.vertexAttrib3f(loc.aOffset,0,0,0); gl.uniform1f(loc.uExplode,0); gl.uniform1f(loc.uAlpha,1);
+      gl.drawArrays(gl.TRIANGLES,0,vertexCount);
+    }
   }
+  if(split.on && split.pickDue && split.mouse && now-split.lastPick>50){
+    split.pickDue=false; split.lastPick=now; setHover(pickPiece(split.mouse[0],split.mouse[1]));
+  }
+  placeCutLabels();
   if(editingActive && appState.skel) drawOverlay(mvp);
   requestAnimationFrame(frame);
 }
@@ -894,6 +1046,7 @@ async function placeStep(){
 function updateHint(){ const h=$('#hint');
   if(appState.place){ h.textContent=(appState.place.a?'click the SECOND end':'click the FIRST end')+' on a strut, edge, or joint · Esc to cancel'; }
   else if(appState.on){ h.textContent='drag empty space to orbit · click elements to edit'; }
+  else if(split.on) h.textContent='drag to orbit · scroll to zoom · hover a piece to see its cuts';
   else h.textContent='drag to orbit · scroll to zoom'; }
 
 function selectHit(hit){
@@ -993,11 +1146,13 @@ async function poll(){
     $('#seed').textContent=s.seed||'—';
     $('#tris').textContent=(s.tris||0).toLocaleString();
     $('#building').classList.toggle('on',!!s.building);
+    if(!exporting) $('#export').textContent=s.mode==='split'?'Export pieces':'Export STL';
+    $('#exportCard h3').textContent=s.mode==='split'?'Export pieces':'Export STL';
     if(s.building) $('#buildFill').style.width=Math.round((s.buildProgress||0)*100)+'%';
     appState.modified=!!s.modified;
     if(typeof s.showHandshakes==='boolean')appState.showHandshakes=s.showHandshakes;
     if(s.seed && cfg.seed!==s.seed){cfg.seed=s.seed;const f=$('#f_seed');if(f)f.value=s.seed;}
-    if(typeof s.version==='number' && s.version!==loadedVersion && !s.building){ await loadMesh(); }
+    if(typeof s.version==='number' && s.version!==loadedVersion && !s.building){ await loadMesh(); updateHint(); }
     // refetch skeleton if it changed under us (e.g. discard/regen) while editing
     if(appState.on && typeof s.skelVersion==='number' && s.skelVersion!==appState.skelVersion && !appState.drag){
       await loadSkeleton();

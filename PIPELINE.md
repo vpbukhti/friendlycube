@@ -41,6 +41,9 @@ seed + config
    │
    ▼
 [8] output ................ binary mesh → WebGL viewer  ·  or  → binary STL
+   │
+   ▼  (optional)
+[9] print split ........... printable pieces, guide rods, numbered cuts
 ```
 
 Stages 1–4 live in `internal/engine` (`topology.go`, `struts.go`, `joints.go`,
@@ -214,6 +217,91 @@ The mesh is emitted either as a compact binary buffer for the WebGL viewer
 outward via the signed volume.
 
 ---
+
+## Print split
+
+`engine/split_*.go` turns the skin into printable pieces. The skin is meshed
+once and then cut like Blender's bisect: crossed triangles are split at the
+plane, the section loop gets one copy of its vertices per side, and each side
+is closed with a cap triangulated in the plane. Pieces are the connected
+components left. Planning runs on a mesh at `planVoxelMM`; the export replays
+the same cut program on a mesh at `voxelMM`.
+
+1. **Graph** (`split_graph.go`). The 12 edges, the struts and the supports are
+   tubes; tubes passing close enough for their skins to fuse share a junction.
+   - A junction is a *vertex* where thick tubes meet (three arms, or two from
+     different tubes) or where two or more supports land.
+   - Thick tubes are split only at vertices. A support landing on a tube
+     mid-span doesn't split the tube; the support is cut near it instead.
+2. **Cut distances.** Each branch's skin radius is probed around its axis (12
+   directions, every 0.12·r), walking out from the junction past the other
+   tubes' cylinders. The branch piece stands on one end:
+   - **Top** end: the first spot where, for the next 1.5·r, the skin widens by
+     at most `tan(strutTilt)` per unit height toward the joint (`jointTilt` for
+     supports: their fillet is joint geometry).
+   - **Bottom** end: the section may sit deeper in the flare (walls leaning in
+     going up print fine) while it stays a clean blob of at most 1.6·r (3·r for
+     supports).
+   - Branches too short to stand alone are absorbed into their joint; supports
+     too short for two cuts get one across their middle.
+3. **Fitting on the mesh** (`split_plan.go`, `split_mesh.go`). Each cut's
+   section is the loop around its axis point. It must stay narrow, contain no
+   other tube's axis, and not touch any other cut's section (checked where the
+   two planes meet). Each branch piece must come off on its own. A cut failing
+   any of these moves away from its joint.
+4. **Atoms and orientation.** After all branch cuts, each connected component
+   is an atom. A piece standing on one of its cut faces is scored by the area of
+   downward-facing surface steeper than its limit: 15° on struts, 35° on joints
+   and around support stubs, ignoring the first 1.5 cells above the bed.
+   - A joint prints whole on its best face if that's clean.
+   - Otherwise one split plane is searched: 500 directions over the hemisphere ×
+     5 offsets, then local refinement, scoring both halves standing on the cut.
+     Slicing through a cut face is penalised. Every loop the plane leaves must be
+     a real face (≥ 8 mm²).
+5. **Merge.** Neighbouring atoms are greedily united (their cut undone) while
+   the union still prints on one of its outer faces. Thin cuts go first, then the
+   smallest faces.
+6. **Rods and numbers** (`split_cuts.go`, `split_glyph.go`). Each remaining cut
+   is laid out on its exact 2D outline, with a clearance grid from a distance
+   transform.
+   - The main rod goes where `footprint + wall` fits, otherwise the thin rod;
+     a second rod is added as far from the first as still fits. Each socket is
+     checked in 3D on both sides (inside the skin, crossing no other cut except
+     a split seam on its own face).
+   - The rod is a trapezoid prism tapering to `taper` at both ends about its
+     flat base. The rod is its socket's section inset by `clearanceMM` on every
+     side (base, top, both slopes); the socket has an extra
+     0.3 mm of depth for glue.
+   - Numbers are drawn as round-capped strokes, outlined into exact contours
+     (marching squares on the stroke distance, then simplified), 1–2 mm tall (strokes at least 0.25 mm)
+     with an orientation bar, upright or turned 90°. The second face's copy is
+     mirrored so each reads correctly.
+   - A face with no room for a rod and its number together gets a dash key
+     instead: the bar under the number widens into a fixed 1 × 3 mm groove,
+     1.2 mm deep in both faces, and a loose key `clearanceMM` smaller per side sits half in
+     each. Its grooves may not cross any other cut, split seams included.
+   - Sockets and numbers become pockets: holes in the cap triangulation, with
+     walls and a floor. Split faces are laid out last, on a mesh that already
+     has the pockets of the faces they cross.
+7. **Export** (`split_export.go`). The cut program replays on the export mesh:
+   branch cuts, then each split plane on the component holding its joint (its
+   loops are found again by position), then merged cuts are undone by welding
+   their loop vertices back together. Shells are matched to planned pieces by
+   their cut faces. The combined STL keeps every piece and rod in place; the tar
+   holds each piece turned onto its print face.
+
+### Print split parameters (`print` in the config)
+
+| key | meaning |
+|-----|---------|
+| `cubeMM` | physical cube edge; sets the mm-per-unit scale |
+| `strutTilt` / `jointTilt` | max overhang (° from vertical) on strut / joint pieces |
+| `clearanceMM` | gap on every side of a rod or dash key in its socket (mm) |
+| `planVoxelMM` / `voxelMM` | skin mesh cell for planning + preview / for export (cut faces are exact either way) |
+| `minPieceMM` | shorter strut sections stay part of their joint |
+| `merge`, `engrave`, `engraveDepthMM` | re-merge printable neighbours; number engraving |
+| `mainRod`, `thinRod` | rod `baseMM`, `topMM`, `heightMM`, `lengthMM`, `taper`, `wallMM` |
+| `explode` | view only: pull pieces apart |
 
 ## Parameters
 

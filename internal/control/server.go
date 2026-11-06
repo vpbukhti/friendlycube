@@ -1,6 +1,7 @@
 package control
 
 import (
+	"crypto/sha256"
 	_ "embed"
 	"encoding/binary"
 	"encoding/json"
@@ -60,7 +61,16 @@ type App struct {
 	exportFrac   float64
 	exportPath   string // temp file holding the meshed STL
 	exportName   string // download filename presented to the browser
+	exportTar    string // split exports: temp file holding the per-piece archive
+	exportTarNm  string
 	exportErr    string
+
+	// The print-split plan is expensive (tens of seconds), so it is cached by
+	// a hash of everything it depends on; view-only knobs (explode) reuse it.
+	splitMu   sync.Mutex
+	splitKey  [32]byte
+	splitPlan *engine.SplitPlan
+	splitInfo []byte // JSON for /api/split
 
 	buildSignal chan struct{} // buffered(1); coalesces rebuild requests
 }
@@ -111,6 +121,18 @@ func (a *App) worker() {
 		}
 		if preview {
 			mode = "skin"
+		}
+		if mode == "split" {
+			plan := a.planSplit(cfg, skel, func(f float64) { a.buildProgress.Store(int64(f * 1000)) })
+			pos, nrm, col, pid, off := plan.PreviewBuffers()
+			data := encodeMesh(pos, nrm, col, pid, off)
+			a.mu.Lock()
+			a.meshData = data
+			a.meshVersion++
+			a.triCount = len(pos) / 9
+			a.building = false
+			a.mu.Unlock()
+			continue
 		}
 		var g *engine.Group
 		if mode == "debug" {
@@ -180,11 +202,39 @@ func (a *App) Snapshot() (Config, uint32) {
 	return a.cfg, a.seed
 }
 
+// planSplit returns the print-split plan for cfg + skel, reusing the cached one
+// when nothing it depends on changed.
+func (a *App) planSplit(cfg Config, skel *engine.Skeleton, progress func(float64)) *engine.SplitPlan {
+	keyData, _ := json.Marshal(struct {
+		S  engine.Settings
+		K  *engine.Skeleton
+		SP engine.SkinParams
+		PP engine.PrintParams
+	}{cfg.ToSettings(), skel, cfg.ToSkinParams(cfg.Skin.Resolution), cfg.ToPrintParams()})
+	key := sha256.Sum256(keyData)
+	a.splitMu.Lock()
+	defer a.splitMu.Unlock()
+	if a.splitPlan != nil && key == a.splitKey {
+		return a.splitPlan
+	}
+	c := cfg
+	c.Frame.ModifiedSkeleton, c.Frame.GeneratedSkeleton = skel, nil
+	plan := c.PlanSplit(progress)
+	info, _ := json.Marshal(plan.Info())
+	a.splitPlan, a.splitKey, a.splitInfo = plan, key, info
+	return plan
+}
+
 // encodeMesh packs the attribute arrays into a little-endian binary blob:
-// uint32 vertexCount, then positions[3V], normals[3V], colors[3V] as float32.
-func encodeMesh(pos, nrm, col []float32) []byte {
+// uint32 vertexCount, then positions[3V], normals[3V], colors[3V] as float32,
+// then any extra per-vertex arrays (split view: piece IDs[V], offsets[3V]).
+func encodeMesh(pos, nrm, col []float32, extra ...[]float32) []byte {
 	v := uint32(len(pos) / 3)
-	out := make([]byte, 4+(len(pos)+len(nrm)+len(col))*4)
+	n := len(pos) + len(nrm) + len(col)
+	for _, e := range extra {
+		n += len(e)
+	}
+	out := make([]byte, 4+n*4)
 	binary.LittleEndian.PutUint32(out, v)
 	off := 4
 	put := func(s []float32) {
@@ -196,6 +246,9 @@ func encodeMesh(pos, nrm, col []float32) []byte {
 	put(pos)
 	put(nrm)
 	put(col)
+	for _, e := range extra {
+		put(e)
+	}
 	return out
 }
 
@@ -222,6 +275,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("/api/undo", a.handleUndo)
 	mux.HandleFunc("/api/edit-mode", a.handleEditMode)
 	mux.HandleFunc("/api/preview-skin", a.handlePreviewSkin)
+	mux.HandleFunc("/api/split", a.handleSplit)
 	return mux
 }
 
@@ -308,6 +362,7 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.cfg = newCfg
+	viewOnly := !structural && sameIgnoringView(oldCfg, newCfg)
 	if structural {
 		if flags.Discard {
 			a.cfg.Frame.ModifiedSkeleton = nil
@@ -318,8 +373,22 @@ func (a *App) handleConfig(w http.ResponseWriter, r *http.Request) {
 		a.skelVersion++
 	}
 	a.mu.Unlock()
-	a.signalBuild()
+	if !viewOnly {
+		a.signalBuild()
+	}
 	writeJSON(w, map[string]any{"ok": true})
+}
+
+// sameIgnoringView reports whether two configs differ only in knobs that need
+// no re-mesh (view-only, or used only at export time).
+func sameIgnoringView(a, b Config) bool {
+	a.AutoSpin, b.AutoSpin = false, false
+	a.Print.Explode, b.Print.Explode = 0, 0
+	a.Skin.ExportResolution, b.Skin.ExportResolution = 0, 0
+	a.Print.VoxelMM, b.Print.VoxelMM = 0, 0
+	ja, _ := json.Marshal(a)
+	jb, _ := json.Marshal(b)
+	return string(ja) == string(jb)
 }
 
 // frameScalarsEqual compares the structural (skeleton-affecting) frame params,
@@ -392,6 +461,10 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 		res = cfg.Skin.ExportResolution
 	}
 	filename := fmt.Sprintf("lattice-%s.stl", cfg.Seed)
+	split := cfg.Mode == "split"
+	if split {
+		filename = fmt.Sprintf("lattice-%s-split.stl", cfg.Seed)
+	}
 
 	a.exportMu.Lock()
 	if a.exportActive {
@@ -403,6 +476,23 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 	if a.exportPath != "" {
 		_ = os.Remove(a.exportPath)
 		a.exportPath = ""
+	}
+	if a.exportTar != "" {
+		_ = os.Remove(a.exportTar)
+		a.exportTar, a.exportTarNm = "", ""
+	}
+	tarPath := ""
+	if split {
+		tf, err := os.CreateTemp("", "friendlycube-*.tar")
+		if err != nil {
+			a.exportMu.Unlock()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		tarPath = tf.Name()
+		_ = tf.Close()
+		a.exportTar = tarPath
+		a.exportTarNm = fmt.Sprintf("lattice-%s-split.tar", cfg.Seed)
 	}
 	tmp, err := os.CreateTemp("", "friendlycube-*.stl")
 	if err != nil {
@@ -420,15 +510,26 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 	a.exportName = filename
 	a.exportMu.Unlock()
 
+	a.mu.Lock()
+	skel := a.cfg.EffectiveSkeleton().Clone()
+	a.mu.Unlock()
 	// Force skin mode for export regardless of the editor's current view.
-	cfg.Mode = "skin"
+	if !split {
+		cfg.Mode = "skin"
+	}
 	go func() {
 		progress := func(f float64) {
 			a.exportMu.Lock()
 			a.exportFrac = f
 			a.exportMu.Unlock()
 		}
-		err := cfg.StreamSTL(tmpPath, seed, res, progress)
+		var err error
+		if split {
+			plan := a.planSplit(cfg, skel, func(f float64) { progress(0.15 * f) })
+			err = plan.ExportSplit(tmpPath, tarPath, cfg.Print.VoxelMM, func(f float64) { progress(0.15 + 0.85*f) })
+		} else {
+			err = cfg.StreamSTL(tmpPath, seed, res, progress)
+		}
 		a.exportMu.Lock()
 		a.exportActive = false
 		a.exportDone = true
@@ -444,7 +545,7 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	writeJSON(w, map[string]any{"started": true, "filename": filename, "resolution": res})
+	writeJSON(w, map[string]any{"started": true, "filename": filename, "resolution": res, "split": split})
 }
 
 // handleExportDownload streams the most recent finished export as a file
@@ -454,6 +555,9 @@ func (a *App) handleExport(w http.ResponseWriter, r *http.Request) {
 func (a *App) handleExportDownload(w http.ResponseWriter, r *http.Request) {
 	a.exportMu.Lock()
 	path, name := a.exportPath, a.exportName
+	if r.URL.Query().Get("file") == "tar" {
+		path, name = a.exportTar, a.exportTarNm
+	}
 	active, done, errStr := a.exportActive, a.exportDone, a.exportErr
 	a.exportMu.Unlock()
 
@@ -491,6 +595,7 @@ func (a *App) handleExportProgress(w http.ResponseWriter, r *http.Request) {
 		"done":     a.exportDone,
 		"frac":     a.exportFrac,
 		"filename": a.exportName,
+		"tarname":  a.exportTarNm,
 		"error":    a.exportErr,
 	}
 	a.exportMu.Unlock()
@@ -543,6 +648,19 @@ func (a *App) handleLoad(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	a.signalBuild()
 	writeJSON(w, clientConfig(cfg))
+}
+
+// handleSplit returns the current print-split plan summary (pieces, cuts,
+// rods) for the split view; {} before the first split build.
+func (a *App) handleSplit(w http.ResponseWriter, r *http.Request) {
+	a.splitMu.Lock()
+	info := a.splitInfo
+	a.splitMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	if info == nil {
+		info = []byte("{}")
+	}
+	_, _ = w.Write(info)
 }
 
 // ---- editor endpoints ----

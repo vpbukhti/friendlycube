@@ -43,6 +43,23 @@ func MarchingCubes(field *Field, box AABB, res int, progress func(float64)) []Tr
 	return out
 }
 
+// ScalarField is anything marching cubes can triangulate: a signed field that
+// is negative inside, plus a gradient for the per-vertex normals.
+type ScalarField interface {
+	Eval(p Vec3) float64
+	Gradient(p Vec3, eps float64) Vec3
+}
+
+// MarchGrid triangulates f's zero isosurface over box on an nx×ny×nz grid (a
+// non-cubic box gets a non-cubic grid, so cells can stay roughly isotropic).
+func MarchGrid(f ScalarField, box AABB, nx, ny, nz int, progress func(float64)) []Triangle {
+	var out []Triangle
+	marchStreamN(f, box, nx, ny, nz, progress, func(slab []Triangle) {
+		out = append(out, slab...)
+	})
+	return out
+}
+
 // marchStream is the streaming core: it sweeps Z in slabs and calls emit with
 // each slab's triangles, in ascending (k, j, i) order. emit is called serially
 // (never concurrently), so the caller can append or write without locking.
@@ -51,7 +68,12 @@ func marchStream(field *Field, box AABB, res int, progress func(float64), emit f
 		res = 2
 	}
 	field.Build()
-	nx, ny, nz := res, res, res
+	marchStreamN(field, box, res, res, res, progress, emit)
+}
+
+// marchStreamN is marchStream over an arbitrary field and an nx×ny×nz grid.
+func marchStreamN(field ScalarField, box AABB, nx, ny, nz int, progress func(float64), emit func([]Triangle)) {
+	nx, ny, nz = maxI(nx, 2), maxI(ny, 2), maxI(nz, 2)
 	dx := (box.Max[0] - box.Min[0]) / float64(nx-1)
 	dy := (box.Max[1] - box.Min[1]) / float64(ny-1)
 	dz := (box.Max[2] - box.Min[2]) / float64(nz-1)
@@ -59,6 +81,9 @@ func marchStream(field *Field, box AABB, res int, progress func(float64), emit f
 	cellNz := nz - 1
 
 	nWorkers := runtime.GOMAXPROCS(0)
+	if w := ny / 8; w < nWorkers {
+		nWorkers = w // small grids: goroutine overhead beats the work
+	}
 	if nWorkers < 1 {
 		nWorkers = 1
 	}
@@ -197,7 +222,16 @@ func marchStream(field *Field, box AABB, res int, progress func(float64), emit f
 // extractLayer triangulates the single cell layer at grid-z index k, whose
 // bottom (z=k) and top (z=k+1) samples are lo and hi, and appends the resulting
 // triangles to out. Iterates j then i to match the canonical grid order.
-func extractLayer(field *Field, box AABB, nx, ny, k int, dx, dy, dz, gradEps float64, lo, hi []float64, out *[]Triangle) {
+// flatNormaler is implemented by fields whose meshes only need face normals
+// (taken from the winding, which is always outward) — skipping the 18 field
+// evaluations per triangle a gradient normal costs.
+type flatNormaler interface{ FlatNormals() bool }
+
+func extractLayer(field ScalarField, box AABB, nx, ny, k int, dx, dy, dz, gradEps float64, lo, hi []float64, out *[]Triangle) {
+	flat := false
+	if fn, ok := field.(flatNormaler); ok {
+		flat = fn.FlatNormals()
+	}
 	x0base := box.Min[0]
 	z0 := box.Min[2] + float64(k)*dz
 	for j := 0; j < ny-1; j++ {
@@ -255,6 +289,11 @@ func extractLayer(field *Field, box AABB, nx, ny, k int, dx, dy, dz, gradEps flo
 				va := verts[row[t]]
 				vb := verts[row[t+1]]
 				vc := verts[row[t+2]]
+				if flat {
+					n := vb.Sub(va).Cross(vc.Sub(va)).Normalize()
+					*out = append(*out, Triangle{A: va, B: vb, C: vc, NA: n, NB: n, NC: n})
+					continue
+				}
 				na := field.Gradient(va, gradEps)
 				nb := field.Gradient(vb, gradEps)
 				nc := field.Gradient(vc, gradEps)

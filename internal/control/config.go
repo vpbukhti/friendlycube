@@ -24,12 +24,32 @@ import (
 // sentinel meaning "auto" — the engine derives them from the tube radius / the
 // corner mode.
 type Config struct {
-	Mode     string `json:"mode"`     // "skin" (implicit sleeve) or "debug" (colored features)
+	Mode     string `json:"mode"`     // "skin" (implicit sleeve), "debug" (colored features) or "split" (print pieces)
 	Seed     string `json:"seed"`     // hex, e.g. "1a2b3c"; "" = random on startup
 	AutoSpin bool   `json:"autoSpin"` // idle auto-rotation
 
 	Skin  SkinConfig  `json:"skin"`
 	Frame FrameConfig `json:"frame"`
+	Print PrintConfig `json:"print"`
+}
+
+// PrintConfig holds the print-splitting knobs (see engine.PrintParams): how the
+// skin is cut into printable pieces, the guide rods and the engraved numbers.
+// None of them touch the skeleton. Explode is view-only.
+type PrintConfig struct {
+	CubeMM         float64        `json:"cubeMM"`      // physical cube edge (mm)
+	StrutTilt      float64        `json:"strutTilt"`   // max overhang on strut pieces (° from vertical)
+	JointTilt      float64        `json:"jointTilt"`   // max overhang on joint pieces (° from vertical)
+	ClearanceMM    float64        `json:"clearanceMM"` // gap on every side of a rod or key in its socket (mm)
+	PlanVoxelMM    float64        `json:"planVoxelMM"` // planning / preview grid cell (mm)
+	VoxelMM        float64        `json:"voxelMM"`     // export grid cell (mm)
+	MinPieceMM     float64        `json:"minPieceMM"`
+	Merge          bool           `json:"merge"`
+	Engrave        bool           `json:"engrave"`
+	EngraveDepthMM float64        `json:"engraveDepthMM"`
+	MainRod        engine.RodSpec `json:"mainRod"`
+	ThinRod        engine.RodSpec `json:"thinRod"`
+	Explode        float64        `json:"explode"` // view only: pull pieces apart
 }
 
 // SkinConfig holds the implicit-skin + meshing/view knobs. Editing any of these
@@ -108,6 +128,7 @@ func DefaultConfig() Config {
 			Relax:            0,
 			Lambda:           0.1,
 		},
+		Print: defaultPrintConfig(),
 		Frame: FrameConfig{
 			CubeSize:         2.0,
 			StrutR:           0.085,
@@ -132,6 +153,30 @@ func DefaultConfig() Config {
 			SupportMinLen:    0.6,
 		},
 	}
+}
+
+func defaultPrintConfig() PrintConfig {
+	p := engine.DefaultPrintParams()
+	return PrintConfig{
+		CubeMM: p.CubeMM, StrutTilt: p.StrutTilt, JointTilt: p.JointTilt, ClearanceMM: p.ClearanceMM,
+		PlanVoxelMM: p.PlanVoxelMM, VoxelMM: p.VoxelMM, MinPieceMM: p.MinPieceMM, Merge: p.Merge,
+		Engrave: p.Engrave, EngraveDepthMM: p.EngraveDepthMM, MainRod: p.MainRod, ThinRod: p.ThinRod,
+	}
+}
+
+// ToPrintParams maps the print-split knobs onto the engine's PrintParams.
+func (c Config) ToPrintParams() engine.PrintParams {
+	p := c.Print
+	return engine.PrintParams{
+		CubeMM: p.CubeMM, StrutTilt: p.StrutTilt, JointTilt: p.JointTilt, ClearanceMM: p.ClearanceMM,
+		PlanVoxelMM: p.PlanVoxelMM, VoxelMM: p.VoxelMM, MinPieceMM: p.MinPieceMM, Merge: p.Merge,
+		Engrave: p.Engrave, EngraveDepthMM: p.EngraveDepthMM, MainRod: p.MainRod, ThinRod: p.ThinRod,
+	}
+}
+
+// PlanSplit plans the print split of the current skeleton + skin.
+func (c Config) PlanSplit(progress func(float64)) *engine.SplitPlan {
+	return engine.PlanSplit(c.ToSettings(), c.EffectiveSkeleton(), c.ToSkinParams(c.Skin.Resolution), c.ToPrintParams(), progress)
 }
 
 // LoadConfig reads a JSON config, overlaying it on the baked-in defaults. Absent
