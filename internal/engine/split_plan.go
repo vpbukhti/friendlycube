@@ -581,6 +581,10 @@ func (pl *SplitPlan) tol(set []int) float64 {
 	for _, ai := range set {
 		a += pl.atoms[ai].area
 	}
+	return pl.tolArea(a)
+}
+
+func (pl *SplitPlan) tolArea(a float64) float64 {
 	return math.Max(6/(pl.MMPerUnit*pl.MMPerUnit), 0.006*a)
 }
 
@@ -623,15 +627,39 @@ func (pl *SplitPlan) bestBed(set []int) bedPick {
 // ---- joints ----
 
 type splitCand struct {
-	n    Vec3
-	d    float64
-	cost float64
+	n     Vec3
+	d     float64
+	cost  float64 // overhang of both halves, plus penalties
+	ok    bool    // both halves print standing on the cut
+	joins int     // neighbours a half can take in without overhanging
+}
+
+// better ranks split candidates: printable halves first, then those that let
+// more neighbours join a half (fewer pieces), then the cheapest.
+func (a splitCand) better(b splitCand) bool {
+	if a.ok != b.ok {
+		return a.ok
+	}
+	if a.ok && a.joins != b.joins {
+		return a.joins > b.joins
+	}
+	return a.cost < b.cost
 }
 
 // decideJoints keeps each joint whole when it prints on one of its faces, and
 // otherwise cuts it with the best plane that leaves two printable halves.
 func (pl *SplitPlan) decideJoints(m *cutMesh) {
 	cands := make([][]splitCand, len(pl.atoms))
+	owner := map[int32]int{}
+	for ai, at := range pl.atoms {
+		for _, tg := range at.Tags {
+			if _, dup := owner[tg]; dup {
+				owner[tg] = -1
+			} else {
+				owner[tg] = ai
+			}
+		}
+	}
 	var wg sync.WaitGroup
 	for ai, at := range pl.atoms {
 		if at.Kind != "joint" {
@@ -644,7 +672,7 @@ func (pl *SplitPlan) decideJoints(m *cutMesh) {
 			if whole.ok && whole.cost <= pl.tol([]int{ai}) {
 				return
 			}
-			cs := pl.searchSplit(ai)
+			cs := pl.searchSplit(ai, owner)
 			if len(cs) > 0 && (!whole.ok || cs[0].cost < whole.cost) {
 				cands[ai] = cs
 			}
@@ -710,10 +738,12 @@ func ringCentroid(r []vec2) vec2 {
 	return vec2{cx / (3 * a), cy / (3 * a)}
 }
 
-// searchSplit samples plane normals over a hemisphere and offsets through the
-// joint, scoring the overhang of both halves (each standing on the cut), and
-// refines around the best. Returns candidates, cheapest first.
-func (pl *SplitPlan) searchSplit(ai int) []splitCand {
+// searchSplit samples plane normals over a hemisphere (plus the axes of the
+// struts around the joint) and offsets through the joint, scoring the overhang
+// of both halves (each standing on the cut), and refines around the best.
+// owner maps a cap tag to the one atom carrying it. Returns candidates, best
+// first.
+func (pl *SplitPlan) searchSplit(ai int, owner map[int32]int) []splitCand {
 	a := pl.atoms[ai]
 	c, R := a.center, math.Max(a.R, 2*pl.vox)
 	tagIdx := map[int32]int{}
@@ -721,54 +751,93 @@ func (pl *SplitPlan) searchSplit(ai int) []splitCand {
 		tagIdx[tg] = i
 	}
 	nf := len(a.Tags)
+	// The atom across each face, and its cut's normal: cutting square to a
+	// strut lets the half stand on the cut with the strut rising from it.
+	nbr := make([]int, nf)
+	var axes []Vec3
+	for i, tg := range a.Tags {
+		nbr[i] = -1
+		if nb, ok := owner[tg^1]; ok && nb >= 0 {
+			nbr[i] = nb
+			axes = append(axes, pl.cuts[tg>>1].F.N)
+		}
+	}
 	sinJ := math.Sin(pl.Print.JointTilt*math.Pi/180) + 0.03
-	eval := func(n Vec3, d float64) float64 {
+	eval := func(n Vec3, d float64) splitCand {
 		faceP := make([]float64, nf)
 		faceN := make([]float64, nf)
-		var cost, areaP, areaN float64
+		ovP := make([]float64, nf)
+		ovN := make([]float64, nf)
+		var costP, costN, areaP, areaN float64
 		for i := range a.tris {
 			t := &a.tris[i]
 			h := t.C.Dot(n) - d
 			nu := t.N.Dot(n)
+			fi := -1
 			if t.Tag >= 0 {
-				if h > 0 {
-					faceP[tagIdx[t.Tag]] += t.Area
-				} else {
-					faceN[tagIdx[t.Tag]] += t.Area
-				}
+				fi = tagIdx[t.Tag]
 			}
 			if h > 0 {
 				areaP += t.Area
+				if fi >= 0 {
+					faceP[fi] += t.Area
+				}
 				if h >= 1.5*pl.vox && -nu > sinJ {
-					cost += t.Area
+					costP += t.Area
+					if fi >= 0 {
+						ovP[fi] += t.Area
+					}
 				}
 			} else {
 				areaN += t.Area
+				if fi >= 0 {
+					faceN[fi] += t.Area
+				}
 				if -h >= 1.5*pl.vox && nu > sinJ {
-					cost += t.Area
+					costN += t.Area
+					if fi >= 0 {
+						ovN[fi] += t.Area
+					}
 				}
 			}
 		}
 		if areaP < 0.12*a.area || areaN < 0.12*a.area {
-			return math.MaxFloat64
+			return splitCand{cost: math.MaxFloat64}
 		}
+		cost := costP + costN
 		// Slicing through a cut face splits its contact in two: weaker, and
 		// each part too small for a rod. Penalise the smaller part.
 		for i := range faceP {
 			cost += math.Min(faceP[i], faceN[i])
 		}
-		return cost + 0.02*a.area*math.Abs(d-c.Dot(n))/R
+		cost += 0.02 * a.area * math.Abs(d-c.Dot(n)) / R
+		sc := splitCand{n: n, d: d, cost: cost}
+		sc.ok = costP <= pl.tolArea(areaP) && costN <= pl.tolArea(areaN)
+		if !sc.ok {
+			return sc
+		}
+		// Count the neighbours that could join the half they hang off: the
+		// fewer of them left on their own, the fewer pieces.
+		for i, nb := range nbr {
+			switch {
+			case nb < 0:
+			case faceN[i] == 0 && pl.canJoin(nb, a.Tags[i]^1, n, d, costP-ovP[i], areaP):
+				sc.joins++
+			case faceP[i] == 0 && pl.canJoin(nb, a.Tags[i]^1, n.Neg(), -d, costN-ovN[i], areaN):
+				sc.joins++
+			}
+		}
+		return sc
 	}
 	var all []splitCand
-	for _, n := range fibHemisphere(500) {
+	for _, n := range append(fibHemisphere(500), axes...) {
 		for _, o := range []float64{-0.6, -0.3, 0, 0.3, 0.6} {
-			d := c.Dot(n) + o*R
-			if v := eval(n, d); v < math.MaxFloat64 {
-				all = append(all, splitCand{n, d, v})
+			if sc := eval(n, c.Dot(n)+o*R); sc.cost < math.MaxFloat64 {
+				all = append(all, sc)
 			}
 		}
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].cost < all[j].cost })
+	sort.Slice(all, func(i, j int) bool { return all[i].better(all[j]) })
 	if len(all) > 40 {
 		all = all[:40]
 	}
@@ -788,8 +857,8 @@ func (pl *SplitPlan) searchSplit(ai int) []splitCand {
 					n := n0.Add(e1.Mul(scale * float64(i) / 3)).Add(e2.Mul(scale * float64(j) / 3)).Normalize()
 					for _, o := range []float64{-0.1, 0, 0.1} {
 						d := d0 + n.Sub(n0).Dot(c) + o*scale*R
-						if v := eval(n, d); v < best.cost {
-							best = splitCand{n, d, v}
+						if sc := eval(n, d); sc.better(best) {
+							best = sc
 						}
 					}
 				}
@@ -797,8 +866,16 @@ func (pl *SplitPlan) searchSplit(ai int) []splitCand {
 		}
 		all[k] = best
 	}
-	sort.SliceStable(all, func(i, j int) bool { return all[i].cost < all[j].cost })
+	sort.SliceStable(all, func(i, j int) bool { return all[i].better(all[j]) })
 	return all
+}
+
+// canJoin reports whether atom nb, attached to a joint half by its face tag,
+// still prints once joined to that half standing on the plane C·up = d. The
+// half itself overhangs by base over area.
+func (pl *SplitPlan) canJoin(nb int, tag int32, up Vec3, d, base, area float64) bool {
+	c, ok := pl.cost([]int{nb}, map[int32]bool{tag: true}, up.Mul(d), up.Neg())
+	return ok && base+c <= pl.tolArea(area+pl.atoms[nb].area)
 }
 
 // fibHemisphere returns n roughly uniform unit vectors on the upper hemisphere
